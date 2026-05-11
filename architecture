@@ -1,0 +1,312 @@
+Build an industry-grade adaptive Hard Rules Engine as a stateless and concurrent Rust microservice.
+
+==================================================
+OBJECTIVE
+==================================================
+
+The service acts as a deterministic security enforcement engine.
+
+It receives incoming API requests from the main gateway, validates them against predefined hard security rules, and returns PASS or FAIL responses.
+
+The engine must:
+- process requests concurrently
+- remain stateless
+- scale horizontally
+- support millions of requests
+- use indexed in-memory rule matching
+- support adaptive AI-assisted rule learning
+- dynamically reload rules without restarting
+
+This service does NOT handle:
+- authentication
+- JWT validation
+- API key validation
+- rate limiting
+- load balancing
+- semantic reasoning
+- orchestration
+
+Those are handled by the main gateway.
+
+==================================================
+CORE ARCHITECTURE
+==================================================
+
+Main Gateway
+      ↓
+Rust Hard Rules Engine
+      ↓
+Indexed Rule Matching Engine
+      ↓
+PASS / FAIL Response
+
+==================================================
+ADAPTIVE RULE LEARNING FLOW
+==================================================
+
+Request
+   ↓
+Indexed Rule Matching
+
+IF Rule Exists:
+   Return PASS / FAIL immediately
+
+IF No Rule Matches:
+   Forward request to AI agent
+      ↓
+   AI analyzes unknown pattern
+      ↓
+   Generate suggested rule/signature
+      ↓
+   Validate generated rule
+      ↓
+   Store approved rule in PostgreSQL
+      ↓
+   Dynamically reload runtime indexes
+      ↓
+   Return final PASS / FAIL response
+
+==================================================
+TECH STACK
+==================================================
+
+Language:
+- Rust
+
+Framework:
+- Axum
+
+Async Runtime:
+- Tokio
+
+Rule Matching:
+- aho-corasick
+- precompiled regex
+
+Serialization:
+- serde
+
+Database:
+- PostgreSQL
+
+Containerization:
+- Docker
+
+Deployment:
+- AWS ECS Fargate
+
+Container Registry:
+- AWS ECR
+
+Logging:
+- tracing
+
+Configuration:
+- dotenvy
+
+==================================================
+MICROSERVICE DESIGN RULES
+==================================================
+
+The service must be:
+- stateless
+- concurrent
+- deterministic
+- horizontally scalable
+- async-first
+- memory-safe
+
+Rules:
+- no session storage
+- no per-user memory
+- no blocking operations
+- no disk reads during request processing
+- no database reads during fast-path matching
+- all rules loaded into memory at runtime
+
+==================================================
+REQUEST FLOW
+==================================================
+
+Incoming Request
+      ↓
+Normalize Input
+      ↓
+Tokenizer
+      ↓
+Aho-Corasick Indexed Matching
+      ↓
+Candidate Rule Selection
+      ↓
+Regex Verification
+      ↓
+PASS / FAIL Decision
+
+==================================================
+SUPPORTED HARD RULE TYPES
+==================================================
+
+1. SQL Injection Detection
+- DROP TABLE
+- UNION SELECT
+- OR 1=1
+- xp_cmdshell
+
+2. Dangerous Command Detection
+- rm -rf
+- chmod 777
+- curl | sh
+- powershell execution
+
+3. Restricted Operations
+- filesystem deletion
+- credential exposure
+- shell execution attempts
+
+4. Founder/Manager Custom Rules
+- blocked keywords
+- protected APIs
+- restricted resources
+
+5. Request Validation
+- malformed JSON
+- oversized payloads
+- invalid schema
+
+==================================================
+RULE STORAGE ARCHITECTURE
+==================================================
+
+PostgreSQL acts as:
+- persistent rule store
+- rule versioning system
+- searchable rule database
+- adaptive rule storage
+
+The runtime engine must:
+- load rules at startup
+- compile regex at startup
+- build in-memory indexes
+- dynamically reload indexes when rules update
+
+==================================================
+RULE MATCHING ARCHITECTURE
+==================================================
+
+Use multi-layer indexed matching:
+
+Layer 1:
+- tokenization
+
+Layer 2:
+- Aho-Corasick multi-pattern matching
+
+Layer 3:
+- candidate rule filtering
+
+Layer 4:
+- precompiled regex verification
+
+Layer 5:
+- final PASS / FAIL decision
+
+==================================================
+DATABASE DESIGN
+==================================================
+
+rules table fields:
+- id
+- category
+- severity
+- keywords
+- regex_pattern
+- action
+- enabled
+- source
+- created_at
+- updated_at
+
+==================================================
+AI FALLBACK RULES
+==================================================
+
+AI-generated rules must NEVER directly enter production runtime.
+
+Generated rules must pass:
+- regex safety validation
+- duplication checks
+- false-positive checks
+- performance validation
+
+Only validated rules can:
+- be stored in PostgreSQL
+- trigger runtime reload
+
+==================================================
+API DESIGN
+==================================================
+
+Endpoint:
+POST /check
+
+Request Example:
+{
+  "request_id": "abc123",
+  "content": "DROP TABLE users"
+}
+
+PASS Response:
+{
+  "status": "PASS",
+  "reason": "safe_request"
+}
+
+FAIL Response:
+{
+  "status": "FAIL",
+  "reason": "dangerous_sql_detected",
+  "matched_rule": "sql_drop_table"
+}
+
+==================================================
+PERFORMANCE REQUIREMENTS
+==================================================
+
+The engine must:
+- process requests concurrently
+- support millions of requests
+- minimize regex execution
+- avoid unnecessary rule scanning
+- preload all runtime structures into memory
+- use async request handling
+- avoid runtime YAML parsing
+- avoid runtime disk IO
+
+==================================================
+DEPLOYMENT REQUIREMENTS
+==================================================
+
+Deployment Platform:
+- AWS ECS Fargate
+
+Requirements:
+- stateless containers
+- horizontal autoscaling
+- Docker-based deployment
+- ECR image storage
+- CloudWatch-compatible logging
+
+==================================================
+FINAL SYSTEM CHARACTERISTICS
+==================================================
+
+The final engine must be:
+- deterministic
+- adaptive
+- concurrent
+- stateless
+- cloud-native
+- memory-safe
+- horizontally scalable
+- enterprise-grade
+- optimized for high-throughput security enforcement
