@@ -1,1 +1,0 @@
-# lukmi-hard-rules-engine
