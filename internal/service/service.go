@@ -14,9 +14,11 @@ import (
 )
 
 var (
-	ErrInvalidMessage   = errors.New("invalid message content or type")
+	ErrInvalidMessage   = errors.New("invalid message content or payload too large")
 	ErrInvalidReference = errors.New("shared content requires a valid reference_id")
 )
+
+const MaxTextLength = 10000
 
 type Broadcaster interface {
 	Broadcast(userIDs []string, eventType string, data any)
@@ -49,7 +51,6 @@ func (s *Service) CreateConversation(ctx context.Context, creatorID string, conv
 		convType = "direct"
 	}
 
-	// Ensure creator is included in members
 	membersMap := make(map[string]bool)
 	membersMap[creatorID] = true
 	for _, id := range memberIDs {
@@ -91,7 +92,7 @@ func (s *Service) GetConversation(ctx context.Context, userID, conversationID st
 	return s.repo.GetConversation(ctx, conversationID)
 }
 
-func (s *Service) ListConversations(ctx context.Context, userID string, cursor string, limit int) ([]*model.Conversation, error) {
+func (s *Service) ListConversations(ctx context.Context, userID string, cursor string, limit int) ([]*model.Conversation, string, error) {
 	return s.repo.ListConversations(ctx, userID, cursor, limit)
 }
 
@@ -132,7 +133,11 @@ func (s *Service) SendMessage(ctx context.Context, senderID string, conversation
 		return nil, ErrInvalidMessage
 	}
 
-	// Validate message payload based on MessageType
+	if len(input.TextContent) > MaxTextLength {
+		return nil, ErrInvalidMessage
+	}
+
+	// Payload validation based on MessageType
 	switch input.Type {
 	case model.Text:
 		if input.TextContent == "" && input.Ciphertext == "" {
@@ -146,6 +151,14 @@ func (s *Service) SendMessage(ctx context.Context, senderID string, conversation
 		if input.ReferenceID == "" {
 			return nil, ErrInvalidReference
 		}
+	}
+
+	// Sanitize Preview snapshot if present
+	if input.Preview != nil {
+		input.Preview.Username = sanitizeString(input.Preview.Username, 64)
+		input.Preview.Caption = sanitizeString(input.Preview.Caption, 256)
+		input.Preview.Title = sanitizeString(input.Preview.Title, 128)
+		input.Preview.ThumbnailURL = sanitizeString(input.Preview.ThumbnailURL, 512)
 	}
 
 	// Idempotency check on client_message_id
@@ -172,7 +185,20 @@ func (s *Service) SendMessage(ctx context.Context, senderID string, conversation
 		UpdatedAt:      now,
 	}
 
-	created, err := s.repo.CreateMessage(ctx, msg)
+	recipients, _ := s.repo.Members(ctx, conversationID)
+
+	event := &model.Event{
+		ID:             s.id(),
+		Type:           model.EventMessageSent,
+		OccurredAt:     now,
+		Message:        msg,
+		ConversationID: conversationID,
+		SenderID:       senderID,
+		RecipientIDs:   recipients,
+	}
+
+	// Persist message AND outbox event atomically
+	created, err := s.repo.CreateMessageWithOutbox(ctx, msg, event)
 	if err != nil {
 		if errors.Is(err, repository.ErrAlreadyExists) && input.ClientID != "" {
 			existing, getErr := s.repo.GetMessageByClientID(ctx, conversationID, input.ClientID)
@@ -183,23 +209,7 @@ func (s *Service) SendMessage(ctx context.Context, senderID string, conversation
 		return nil, err
 	}
 
-	recipients, _ := s.repo.Members(ctx, conversationID)
-
-	// Build Kafka event
-	event := model.Event{
-		ID:             s.id(),
-		Type:           model.EventMessageSent,
-		OccurredAt:     now,
-		Message:        created,
-		ConversationID: conversationID,
-		SenderID:       senderID,
-		RecipientIDs:   recipients,
-	}
-
-	if s.publisher != nil {
-		_ = s.publisher.Publish(ctx, event)
-	}
-
+	// Broadcast WS event
 	if s.broadcaster != nil {
 		s.broadcaster.Broadcast(recipients, "message.new", created)
 	}
@@ -207,13 +217,13 @@ func (s *Service) SendMessage(ctx context.Context, senderID string, conversation
 	return created, nil
 }
 
-func (s *Service) SyncMessages(ctx context.Context, userID, conversationID string, cursor string, limit int) ([]*model.Message, error) {
+func (s *Service) SyncMessages(ctx context.Context, userID, conversationID string, cursor string, limit int) ([]*model.Message, string, error) {
 	isMember, err := s.repo.IsMember(ctx, conversationID, userID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if !isMember {
-		return nil, repository.ErrNotMember
+		return nil, "", repository.ErrNotMember
 	}
 
 	return s.repo.ListMessages(ctx, conversationID, cursor, limit)
@@ -236,25 +246,21 @@ func (s *Service) MarkRead(ctx context.Context, userID, conversationID, messageI
 		ReadAt:         now,
 	}
 
-	res, err := s.repo.MarkRead(ctx, read)
-	if err != nil {
-		return nil, err
-	}
-
 	recipients, _ := s.repo.Members(ctx, conversationID)
 
-	event := model.Event{
+	event := &model.Event{
 		ID:             s.id(),
 		Type:           model.EventMessageRead,
 		OccurredAt:     now,
-		MessageRead:    res,
+		MessageRead:    read,
 		ConversationID: conversationID,
 		UserID:         userID,
 		RecipientIDs:   recipients,
 	}
 
-	if s.publisher != nil {
-		_ = s.publisher.Publish(ctx, event)
+	res, err := s.repo.MarkReadWithOutbox(ctx, read, event)
+	if err != nil {
+		return nil, err
 	}
 
 	if s.broadcaster != nil {
@@ -273,14 +279,10 @@ func (s *Service) DeleteMessage(ctx context.Context, userID, conversationID, mes
 		return repository.ErrNotMember
 	}
 
-	if err := s.repo.DeleteMessage(ctx, conversationID, messageID, userID); err != nil {
-		return err
-	}
-
 	recipients, _ := s.repo.Members(ctx, conversationID)
 	now := s.now()
 
-	event := model.Event{
+	event := &model.Event{
 		ID:             s.id(),
 		Type:           model.EventMessageDeleted,
 		OccurredAt:     now,
@@ -290,8 +292,8 @@ func (s *Service) DeleteMessage(ctx context.Context, userID, conversationID, mes
 		UserID:         userID,
 	}
 
-	if s.publisher != nil {
-		_ = s.publisher.Publish(ctx, event)
+	if err := s.repo.DeleteMessageWithOutbox(ctx, conversationID, messageID, userID, event); err != nil {
+		return err
 	}
 
 	if s.broadcaster != nil {
@@ -303,4 +305,11 @@ func (s *Service) DeleteMessage(ctx context.Context, userID, conversationID, mes
 	}
 
 	return nil
+}
+
+func sanitizeString(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen]
+	}
+	return s
 }

@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/lukmi/messaging-service/internal/cache"
+	"github.com/lukmi/messaging-service/internal/config"
 )
 
 const (
@@ -30,32 +32,39 @@ type BroadcastPayload struct {
 }
 
 type client struct {
-	conn   *websocket.Conn
-	send   chan []byte
-	userID string
+	conn      *websocket.Conn
+	send      chan []byte
+	userID    string
+	closeOnce sync.Once
 }
 
 type Hub struct {
-	mu       sync.RWMutex
-	users    map[string]map[*client]struct{}
-	upgrader websocket.Upgrader
-	cache    cache.Cache
-	logger   *slog.Logger
-	cancel   func()
+	mu             sync.RWMutex
+	users          map[string]map[*client]struct{}
+	upgrader       websocket.Upgrader
+	cache          cache.Cache
+	logger         *slog.Logger
+	cancel         func()
+	allowedOrigins []string
 }
 
-func NewHub(c cache.Cache, logger *slog.Logger) *Hub {
+func NewHub(cfg *config.Config, c cache.Cache, logger *slog.Logger) *Hub {
+	var origins []string
+	if cfg != nil {
+		origins = cfg.AllowedOrigins
+	}
+
 	h := &Hub{
-		users: make(map[string]map[*client]struct{}),
-		upgrader: websocket.Upgrader{
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
-			CheckOrigin: func(r *http.Request) bool {
-				return true // API Gateway handles cross-origin policies
-			},
-		},
-		cache:  c,
-		logger: logger,
+		users:          make(map[string]map[*client]struct{}),
+		cache:          c,
+		logger:         logger,
+		allowedOrigins: origins,
+	}
+
+	h.upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     h.checkOrigin,
 	}
 
 	if c != nil {
@@ -63,6 +72,33 @@ func NewHub(c cache.Cache, logger *slog.Logger) *Hub {
 	}
 
 	return h
+}
+
+func (h *Hub) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // Permit native clients (Flutter Android/iOS) without Origin header
+	}
+
+	if len(h.allowedOrigins) == 0 {
+		return true // Development mode default
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+
+	for _, allowed := range h.allowedOrigins {
+		if allowed == "*" || stringsEqualFold(allowed, u.Host) || stringsEqualFold(allowed, origin) {
+			return true
+		}
+	}
+
+	if h.logger != nil {
+		h.logger.Warn("websocket origin rejected", "origin", origin)
+	}
+	return false
 }
 
 func (h *Hub) subscribeRedisEvents() {
@@ -125,39 +161,42 @@ func (h *Hub) register(userID string, c *client) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_, _ = h.cache.IncConnections(ctx, userID)
-		_ = h.cache.SetPresence(ctx, userID, "online", 24*time.Hour)
+		_ = h.cache.SetPresence(ctx, userID, "online", 2*time.Minute)
 	}
 
 	if h.logger != nil {
-		h.logger.Info("websocket client connected", "user_id", userID, "device_count", h.Connected(userID))
+		h.logger.Info("websocket client connected", "user_id", userID, "local_devices", h.Connected(userID))
 	}
 }
 
 func (h *Hub) remove(c *client) {
-	h.mu.Lock()
-	userID := c.userID
-	if clients, ok := h.users[userID]; ok {
-		delete(clients, c)
-		if len(clients) == 0 {
-			delete(h.users, userID)
+	c.closeOnce.Do(func() {
+		userID := c.userID
+
+		h.mu.Lock()
+		if clients, ok := h.users[userID]; ok {
+			delete(clients, c)
+			if len(clients) == 0 {
+				delete(h.users, userID)
+			}
 		}
-	}
-	h.mu.Unlock()
+		h.mu.Unlock()
 
-	_ = c.conn.Close()
+		_ = c.conn.Close()
 
-	if h.cache != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		remaining, _ := h.cache.DecConnections(ctx, userID)
-		if remaining <= 0 {
-			_ = h.cache.SetPresence(ctx, userID, "offline", 24*time.Hour)
+		if h.cache != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			remaining, _ := h.cache.DecConnections(ctx, userID)
+			if remaining <= 0 {
+				_ = h.cache.SetPresence(ctx, userID, "offline", 2*time.Minute)
+			}
 		}
-	}
 
-	if h.logger != nil {
-		h.logger.Info("websocket client disconnected", "user_id", userID)
-	}
+		if h.logger != nil {
+			h.logger.Info("websocket client disconnected", "user_id", userID)
+		}
+	})
 }
 
 func (h *Hub) readLoop(c *client) {
@@ -167,6 +206,11 @@ func (h *Hub) readLoop(c *client) {
 	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
 		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		if h.cache != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
+			_ = h.cache.SetPresence(ctx, c.userID, "online", 2*time.Minute)
+		}
 		return nil
 	})
 
@@ -175,7 +219,6 @@ func (h *Hub) readLoop(c *client) {
 		if err != nil {
 			break
 		}
-		// Incoming client messages over WS can be extended if needed
 	}
 }
 
@@ -195,22 +238,10 @@ func (h *Hub) writeLoop(c *client) {
 				return
 			}
 
-			w, err := c.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
+			if err := c.conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 				return
 			}
-			_, _ = w.Write(payload)
 
-			// Add queued messages to current websocket frame
-			n := len(c.send)
-			for i := 0; i < n; i++ {
-				_, _ = w.Write([]byte{'\n'})
-				_, _ = w.Write(<-c.send)
-			}
-
-			if err := w.Close(); err != nil {
-				return
-			}
 		case <-ticker.C:
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -223,10 +254,8 @@ func (h *Hub) writeLoop(c *client) {
 func (h *Hub) Broadcast(userIDs []string, eventType string, data any) {
 	event := Event{Type: eventType, Data: data}
 
-	// 1. Broadcast locally to active devices on this node
 	h.broadcastLocal(userIDs, event)
 
-	// 2. Publish to Redis Pub/Sub for cross-instance node broadcasting
 	if h.cache != nil {
 		bp := BroadcastPayload{UserIDs: userIDs, Event: event}
 		if payload, err := json.Marshal(bp); err == nil {
@@ -254,7 +283,6 @@ func (h *Hub) broadcastLocal(userIDs []string, event Event) {
 					select {
 					case c.send <- payload:
 					default:
-						// If client buffer is full, drop to prevent blocking
 						if h.logger != nil {
 							h.logger.Warn("ws client buffer full, dropping message", "user_id", userID)
 						}
@@ -276,4 +304,18 @@ func (h *Hub) Close() {
 	if h.cancel != nil {
 		h.cancel()
 	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for _, clients := range h.users {
+		for c := range clients {
+			_ = c.conn.Close()
+		}
+	}
+	h.users = make(map[string]map[*client]struct{})
+}
+
+func stringsEqualFold(s1, s2 string) bool {
+	return url.QueryEscape(s1) == url.QueryEscape(s2)
 }

@@ -15,6 +15,8 @@ type MemoryRepository struct {
 	messages      map[string][]*model.Message
 	clientIDs     map[string]*model.Message
 	reads         map[string]*model.MessageRead
+	outboxEvents  map[string]*model.Event
+	outboxStatus  map[string]string
 }
 
 func NewMemoryRepository() *MemoryRepository {
@@ -24,6 +26,8 @@ func NewMemoryRepository() *MemoryRepository {
 		messages:      map[string][]*model.Message{},
 		clientIDs:     map[string]*model.Message{},
 		reads:         map[string]*model.MessageRead{},
+		outboxEvents:  map[string]*model.Event{},
+		outboxStatus:  map[string]string{},
 	}
 }
 
@@ -61,20 +65,49 @@ func (r *MemoryRepository) GetConversation(_ context.Context, id string) (*model
 	return c, nil
 }
 
-func (r *MemoryRepository) ListConversations(_ context.Context, userID, cursor string, limit int) ([]*model.Conversation, error) {
+func (r *MemoryRepository) ListConversations(_ context.Context, userID, cursor string, limit int) ([]*model.Conversation, string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	out := []*model.Conversation{}
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+
+	var cursorTime time.Time
+	var cursorID string
+	var err error
+	if cursor != "" {
+		cursorTime, cursorID, err = DecodeCursor(cursor)
+		if err != nil {
+			return nil, "", ErrInvalidCursor
+		}
+	}
+
+	var candidates []*model.Conversation
 	for id, c := range r.conversations {
 		if m, ok := r.members[id][userID]; ok && m.LeftAt == nil {
-			out = append(out, c)
-			if len(out) == limit {
-				break
+			if !cursorTime.IsZero() {
+				if c.UpdatedAt.Before(cursorTime) || (c.UpdatedAt.Equal(cursorTime) && c.ID < cursorID) {
+					candidates = append(candidates, c)
+				}
+			} else {
+				candidates = append(candidates, c)
 			}
 		}
 	}
-	return out, nil
+
+	out := candidates
+	if len(out) > limit {
+		out = out[:limit]
+	}
+
+	var nextCursor string
+	if len(out) == limit {
+		last := out[len(out)-1]
+		nextCursor = EncodeCursor(last.UpdatedAt, last.ID)
+	}
+
+	return out, nextCursor, nil
 }
 
 func (r *MemoryRepository) Members(_ context.Context, conversationID string) ([]string, error) {
@@ -140,7 +173,7 @@ func (r *MemoryRepository) LeaveConversation(_ context.Context, conversationID, 
 	return nil
 }
 
-func (r *MemoryRepository) CreateMessage(_ context.Context, m *model.Message) (*model.Message, error) {
+func (r *MemoryRepository) CreateMessageWithOutbox(_ context.Context, m *model.Message, event *model.Event) (*model.Message, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -156,6 +189,12 @@ func (r *MemoryRepository) CreateMessage(_ context.Context, m *model.Message) (*
 	if c, ok := r.conversations[m.ConversationID]; ok {
 		c.UpdatedAt = m.CreatedAt
 	}
+
+	if event != nil {
+		r.outboxEvents[event.ID] = event
+		r.outboxStatus[event.ID] = "pending"
+	}
+
 	return m, nil
 }
 
@@ -182,55 +221,83 @@ func (r *MemoryRepository) GetMessageByClientID(_ context.Context, conversationI
 	return m, nil
 }
 
-func (r *MemoryRepository) ListMessages(_ context.Context, conversationID, cursor string, limit int) ([]*model.Message, error) {
+func (r *MemoryRepository) ListMessages(_ context.Context, conversationID, cursor string, limit int) ([]*model.Message, string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-
-	all := r.messages[conversationID]
-	if len(all) == 0 {
-		return []*model.Message{}, nil
-	}
-
-	startIndex := len(all)
-	if cursor != "" {
-		for i, msg := range all {
-			if msg.ID == cursor {
-				startIndex = i
-				break
-			}
-		}
-	}
 
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
 
-	start := startIndex - limit
-	if start < 0 {
-		start = 0
+	var cursorTime time.Time
+	var cursorID string
+	var err error
+	if cursor != "" {
+		cursorTime, cursorID, err = DecodeCursor(cursor)
+		if err != nil {
+			return nil, "", ErrInvalidCursor
+		}
 	}
 
-	result := make([]*model.Message, 0, startIndex-start)
-	for i := startIndex - 1; i >= start; i-- {
-		result = append(result, all[i])
+	all := r.messages[conversationID]
+	var candidates []*model.Message
+
+	for i := len(all) - 1; i >= 0; i-- {
+		msg := all[i]
+		if !cursorTime.IsZero() {
+			if msg.CreatedAt.Before(cursorTime) || (msg.CreatedAt.Equal(cursorTime) && msg.ID < cursorID) {
+				candidates = append(candidates, msg)
+			}
+		} else {
+			candidates = append(candidates, msg)
+		}
 	}
 
-	return result, nil
+	out := candidates
+	if len(out) > limit {
+		out = out[:limit]
+	}
+
+	var nextCursor string
+	if len(out) == limit {
+		last := out[len(out)-1]
+		nextCursor = EncodeCursor(last.CreatedAt, last.ID)
+	}
+
+	return out, nextCursor, nil
 }
 
-func (r *MemoryRepository) MarkRead(_ context.Context, read *model.MessageRead) (*model.MessageRead, error) {
+func (r *MemoryRepository) MarkReadWithOutbox(_ context.Context, read *model.MessageRead, event *model.Event) (*model.MessageRead, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Verify message exists in conversation
+	found := false
+	for _, m := range r.messages[read.ConversationID] {
+		if m.ID == read.MessageID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, ErrNotFound
+	}
 
 	key := read.MessageID + ":" + read.UserID
 	if existing, ok := r.reads[key]; ok {
 		return existing, nil
 	}
 	r.reads[key] = read
+
+	if event != nil {
+		r.outboxEvents[event.ID] = event
+		r.outboxStatus[event.ID] = "pending"
+	}
+
 	return read, nil
 }
 
-func (r *MemoryRepository) DeleteMessage(_ context.Context, conversationID, messageID, userID string) error {
+func (r *MemoryRepository) DeleteMessageWithOutbox(_ context.Context, conversationID, messageID, userID string, event *model.Event) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -244,8 +311,40 @@ func (r *MemoryRepository) DeleteMessage(_ context.Context, conversationID, mess
 			}
 			now := time.Now().UTC()
 			m.DeletedAt = &now
+
+			if event != nil {
+				r.outboxEvents[event.ID] = event
+				r.outboxStatus[event.ID] = "pending"
+			}
 			return nil
 		}
 	}
 	return ErrNotFound
+}
+
+func (r *MemoryRepository) GetPendingOutboxEvents(_ context.Context, limit int) ([]*model.Event, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var pending []*model.Event
+	for id, evt := range r.outboxEvents {
+		if r.outboxStatus[id] == "pending" {
+			pending = append(pending, evt)
+			if len(pending) == limit {
+				break
+			}
+		}
+	}
+	return pending, nil
+}
+
+func (r *MemoryRepository) MarkOutboxEventPublished(_ context.Context, eventID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.outboxStatus[eventID] = "published"
+	return nil
+}
+
+func (r *MemoryRepository) RecordOutboxEventFailure(_ context.Context, eventID string, _ string) error {
+	return nil
 }

@@ -27,18 +27,15 @@ func TestMemoryRepositoryConversationsAndMembers(t *testing.T) {
 		t.Fatalf("create conversation failed: %v", err)
 	}
 
-	// Duplicate create should fail
 	if err := repo.CreateConversation(ctx, conv, []string{"user-1"}); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("expected ErrAlreadyExists, got %v", err)
 	}
 
-	// Get conversation
 	fetched, err := repo.GetConversation(ctx, "c-1")
 	if err != nil || fetched.ID != "c-1" {
 		t.Fatalf("get conversation failed: %v", err)
 	}
 
-	// Members check
 	members, err := repo.Members(ctx, "c-1")
 	if err != nil || len(members) != 2 {
 		t.Fatalf("expected 2 members, got %v", members)
@@ -49,7 +46,6 @@ func TestMemoryRepositoryConversationsAndMembers(t *testing.T) {
 		t.Fatal("user-1 should be a member")
 	}
 
-	// Leave conversation
 	if err := repo.LeaveConversation(ctx, "c-1", "user-2"); err != nil {
 		t.Fatalf("leave conversation failed: %v", err)
 	}
@@ -75,14 +71,13 @@ func TestMemoryRepositoryMessagesAndIdempotency(t *testing.T) {
 		UpdatedAt:      time.Now().UTC(),
 	}
 
-	created, err := repo.CreateMessage(ctx, msg)
+	created, err := repo.CreateMessageWithOutbox(ctx, msg, nil)
 	if err != nil {
 		t.Fatalf("create message failed: %v", err)
 	}
 
-	// Idempotent duplicate check
 	duplicateMsg := &model.Message{
-		ID:             "m-2", // different ID, same clientID
+		ID:             "m-2",
 		ConversationID: "c-1",
 		SenderID:       "user-1",
 		Type:           model.Text,
@@ -90,7 +85,7 @@ func TestMemoryRepositoryMessagesAndIdempotency(t *testing.T) {
 		ClientID:       "client-key-100",
 	}
 
-	existing, err := repo.CreateMessage(ctx, duplicateMsg)
+	existing, err := repo.CreateMessageWithOutbox(ctx, duplicateMsg, nil)
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("expected ErrAlreadyExists on duplicate client_id, got %v", err)
 	}

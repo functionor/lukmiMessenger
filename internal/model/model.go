@@ -78,13 +78,13 @@ const (
 )
 
 type Event struct {
-	ID             string         `json:"event_id"`
-	Type           EventType      `json:"event_type"`
-	OccurredAt     time.Time      `json:"occurred_at"`
-	Message        *Message       `json:"message,omitempty"`
-	MessageRead    *MessageRead   `json:"message_read,omitempty"`
-	ConversationID string         `json:"conversation_id"`
-	SenderID       string         `json:"sender_id,omitempty"`
-	RecipientIDs   []string       `json:"recipient_ids,omitempty"`
-	UserID         string         `json:"user_id,omitempty"`
+	ID             string       `json:"event_id"`
+	Type           EventType    `json:"event_type"`
+	OccurredAt     time.Time    `json:"occurred_at"`
+	Message        *Message     `json:"message,omitempty"`
+	MessageRead    *MessageRead `json:"message_read,omitempty"`
+	ConversationID string       `json:"conversation_id"`
+	SenderID       string       `json:"sender_id,omitempty"`
+	RecipientIDs   []string     `json:"recipient_ids,omitempty"`
+	UserID         string       `json:"user_id,omitempty"`
 }

@@ -1,0 +1,18 @@
+-- Central Lukmi Database Schema Migration for Outbox Pattern
+-- Owner Repository: https://github.com/functionor/lukmi_database
+-- Destination Path: migrations/000002_add_outbox_events.up.sql
+
+CREATE TABLE IF NOT EXISTS outbox_events (
+    event_id VARCHAR(64) PRIMARY KEY,
+    event_type VARCHAR(64) NOT NULL,
+    aggregate_type VARCHAR(64) NOT NULL,
+    aggregate_id VARCHAR(64) NOT NULL,
+    payload JSONB NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    retry_count INT NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events (status, created_at) WHERE status = 'pending';

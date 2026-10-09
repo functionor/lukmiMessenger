@@ -7,19 +7,30 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/lukmi/messaging-service/internal/config"
 )
 
-func TestAuthMiddlewareHeader(t *testing.T) {
-	authHandler := Auth("secret", nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func testConfig() *config.Config {
+	return &config.Config{
+		Env:           "development",
+		JWTSecret:     "test-jwt-secret-32bytes-minimum-key!!",
+		GatewaySecret: "test-gateway-secret-key-16bytes!",
+	}
+}
+
+func TestAuthMiddlewareGatewaySecretSuccess(t *testing.T) {
+	cfg := testConfig()
+	authHandler := Auth(cfg, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uid := GetUserID(r.Context())
-		if uid != "user-123" {
-			t.Fatalf("expected user_id user-123, got %s", uid)
+		if uid != "valid-user-123" {
+			t.Fatalf("expected valid-user-123, got %s", uid)
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/conversations", nil)
-	req.Header.Set("X-User-ID", "user-123")
+	req.Header.Set("X-User-ID", "valid-user-123")
+	req.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 	rec := httptest.NewRecorder()
 
 	authHandler.ServeHTTP(rec, req)
@@ -28,17 +39,35 @@ func TestAuthMiddlewareHeader(t *testing.T) {
 	}
 }
 
-func TestAuthMiddlewareJWTToken(t *testing.T) {
+func TestAuthMiddlewareForgedHeaderRejected(t *testing.T) {
+	cfg := testConfig()
+	authHandler := Auth(cfg, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/conversations", nil)
+	req.Header.Set("X-User-ID", "attacker")
+	req.Header.Set("X-Gateway-Secret", "wrong-secret")
+	rec := httptest.NewRecorder()
+
+	authHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 Unauthorized for forged header", rec.Code)
+	}
+}
+
+func TestAuthMiddlewareJWTValid(t *testing.T) {
+	cfg := testConfig()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": "jwt-user-456",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
-	tokenStr, _ := token.SignedString([]byte("secret"))
+	tokenStr, _ := token.SignedString([]byte(cfg.JWTSecret))
 
-	authHandler := Auth("secret", nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	authHandler := Auth(cfg, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uid := GetUserID(r.Context())
 		if uid != "jwt-user-456" {
-			t.Fatalf("expected user_id jwt-user-456, got %s", uid)
+			t.Fatalf("expected jwt-user-456, got %s", uid)
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -53,8 +82,54 @@ func TestAuthMiddlewareJWTToken(t *testing.T) {
 	}
 }
 
-func TestAuthMiddlewareUnauthorized(t *testing.T) {
-	authHandler := Auth("secret", nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestAuthMiddlewareExpiredJWT(t *testing.T) {
+	cfg := testConfig()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": "jwt-user-456",
+		"exp": time.Now().Add(-time.Hour).Unix(), // Expired
+	})
+	tokenStr, _ := token.SignedString([]byte(cfg.JWTSecret))
+
+	authHandler := Auth(cfg, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/conversations", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	rec := httptest.NewRecorder()
+
+	authHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for expired token", rec.Code)
+	}
+}
+
+func TestAuthMiddlewareNoneAlgorithmRejected(t *testing.T) {
+	cfg := testConfig()
+	authHandler := Auth(cfg, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Create unsigned token with 'none' alg
+	token := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
+		"sub": "attacker",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	tokenStr, _ := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/conversations", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	rec := httptest.NewRecorder()
+
+	authHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for 'none' alg", rec.Code)
+	}
+}
+
+func TestAuthMiddlewareMissingCredentials(t *testing.T) {
+	cfg := testConfig()
+	authHandler := Auth(cfg, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -63,6 +138,6 @@ func TestAuthMiddlewareUnauthorized(t *testing.T) {
 
 	authHandler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", rec.Code)
+		t.Fatalf("status = %d, want 401 for missing credentials", rec.Code)
 	}
 }

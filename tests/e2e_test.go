@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	gorillaWS "github.com/gorilla/websocket"
 	"github.com/lukmi/messaging-service/internal/cache"
+	"github.com/lukmi/messaging-service/internal/config"
 	"github.com/lukmi/messaging-service/internal/httpapi"
 	"github.com/lukmi/messaging-service/internal/kafka"
 	"github.com/lukmi/messaging-service/internal/model"
@@ -19,13 +21,31 @@ import (
 	ws "github.com/lukmi/messaging-service/internal/websocket"
 )
 
+func testCfg() *config.Config {
+	return &config.Config{
+		Env:           "development",
+		JWTSecret:     "test-jwt-secret-32bytes-minimum-key!!",
+		GatewaySecret: "test-gateway-secret-key-16bytes!",
+	}
+}
+
+func generateJWT(userID, secret string) string {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": userID,
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	tokenStr, _ := token.SignedString([]byte(secret))
+	return tokenStr
+}
+
 func TestWebSocketRealtimeDeliveryAndMultiDevice(t *testing.T) {
+	cfg := testCfg()
 	repo := repository.NewMemoryRepository()
 	memCache := cache.NewMemoryCache()
 	publisher := kafka.NewMemoryPublisher(nil)
-	hub := ws.NewHub(memCache, nil)
+	hub := ws.NewHub(cfg, memCache, nil)
 	svc := service.New(repo, publisher, hub)
-	h := httpapi.New(repo, svc, hub, memCache, publisher, "secret")
+	h := httpapi.New(cfg, repo, svc, hub, memCache, publisher)
 
 	server := httptest.NewServer(h.Routes())
 	defer server.Close()
@@ -36,7 +56,8 @@ func TestWebSocketRealtimeDeliveryAndMultiDevice(t *testing.T) {
 		t.Fatalf("create conversation failed: %v", err)
 	}
 
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/ws?token=sarah"
+	sarahToken := generateJWT("sarah", cfg.JWTSecret)
+	wsURL := "ws" + stringsTrimPrefix(server.URL, "http") + "/api/v1/ws?token=" + sarahToken
 
 	// Connect Sarah Device 1
 	wsConn1, _, err := gorillaWS.DefaultDialer.Dial(wsURL, nil)
@@ -61,6 +82,7 @@ func TestWebSocketRealtimeDeliveryAndMultiDevice(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/conversations/"+conv.ID+"/messages", bytes.NewBuffer(msgBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-User-ID", "john")
+	req.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -89,12 +111,13 @@ func TestWebSocketRealtimeDeliveryAndMultiDevice(t *testing.T) {
 }
 
 func TestE2EEAndSharedContentEndToEnd(t *testing.T) {
+	cfg := testCfg()
 	repo := repository.NewMemoryRepository()
 	memCache := cache.NewMemoryCache()
 	publisher := kafka.NewMemoryPublisher(nil)
-	hub := ws.NewHub(memCache, nil)
+	hub := ws.NewHub(cfg, memCache, nil)
 	svc := service.New(repo, publisher, hub)
-	h := httpapi.New(repo, svc, hub, memCache, publisher, "secret")
+	h := httpapi.New(cfg, repo, svc, hub, memCache, publisher)
 
 	server := httptest.NewServer(h.Routes())
 	defer server.Close()
@@ -114,6 +137,7 @@ func TestE2EEAndSharedContentEndToEnd(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/conversations/"+conv.ID+"/messages", bytes.NewBuffer(postShareBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-User-ID", "john")
+	req.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -141,6 +165,7 @@ func TestE2EEAndSharedContentEndToEnd(t *testing.T) {
 	e2eeReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/conversations/"+conv.ID+"/messages", bytes.NewBuffer(e2eeBody))
 	e2eeReq.Header.Set("Content-Type", "application/json")
 	e2eeReq.Header.Set("X-User-ID", "john")
+	e2eeReq.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	e2eeResp, err := http.DefaultClient.Do(e2eeReq)
 	if err != nil {
@@ -155,4 +180,11 @@ func TestE2EEAndSharedContentEndToEnd(t *testing.T) {
 	if e2eeMsg.Ciphertext != "GCM_AES256_CIPHERTEXT_SAMPLE" {
 		t.Fatalf("unexpected ciphertext: %+v", e2eeMsg)
 	}
+}
+
+func stringsTrimPrefix(s, prefix string) string {
+	if len(s) >= len(prefix) && s[:len(prefix)] == prefix {
+		return s[len(prefix):]
+	}
+	return s
 }

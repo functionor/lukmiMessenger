@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/lukmi/messaging-service/internal/cache"
+	"github.com/lukmi/messaging-service/internal/config"
 	"github.com/lukmi/messaging-service/internal/kafka"
 	"github.com/lukmi/messaging-service/internal/model"
 	"github.com/lukmi/messaging-service/internal/repository"
@@ -16,13 +17,22 @@ import (
 	"github.com/lukmi/messaging-service/internal/websocket"
 )
 
+func testCfg() *config.Config {
+	return &config.Config{
+		Env:           "development",
+		JWTSecret:     "test-jwt-secret-32bytes-minimum-key!!",
+		GatewaySecret: "test-gateway-secret-key-16bytes!",
+	}
+}
+
 func TestHealthAndReadyEndpoints(t *testing.T) {
+	cfg := testCfg()
 	repo := repository.NewMemoryRepository()
 	memCache := cache.NewMemoryCache()
 	publisher := kafka.NewMemoryPublisher(nil)
-	hub := websocket.NewHub(memCache, nil)
+	hub := websocket.NewHub(cfg, memCache, nil)
 	svc := service.New(repo, publisher, hub)
-	h := New(repo, svc, hub, memCache, publisher, "test-secret")
+	h := New(cfg, repo, svc, hub, memCache, publisher)
 
 	server := httptest.NewServer(h.Routes())
 	defer server.Close()
@@ -47,12 +57,13 @@ func TestHealthAndReadyEndpoints(t *testing.T) {
 }
 
 func TestCreateAndGetConversationFlow(t *testing.T) {
+	cfg := testCfg()
 	repo := repository.NewMemoryRepository()
 	memCache := cache.NewMemoryCache()
 	publisher := kafka.NewMemoryPublisher(nil)
-	hub := websocket.NewHub(memCache, nil)
+	hub := websocket.NewHub(cfg, memCache, nil)
 	svc := service.New(repo, publisher, hub)
-	h := New(repo, svc, hub, memCache, publisher, "test-secret")
+	h := New(cfg, repo, svc, hub, memCache, publisher)
 
 	server := httptest.NewServer(h.Routes())
 	defer server.Close()
@@ -66,6 +77,7 @@ func TestCreateAndGetConversationFlow(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/conversations", bytes.NewBuffer(reqBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-User-ID", "john")
+	req.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -85,6 +97,7 @@ func TestCreateAndGetConversationFlow(t *testing.T) {
 	// 2. Fetch created conversation as "sarah" (member)
 	getReq, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/conversations/"+conv.ID, nil)
 	getReq.Header.Set("X-User-ID", "sarah")
+	getReq.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	getResp, err := client.Do(getReq)
 	if err != nil {
@@ -97,6 +110,7 @@ func TestCreateAndGetConversationFlow(t *testing.T) {
 	// 3. Unauthorized access attempt by non-member "mallory"
 	malloryReq, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/conversations/"+conv.ID, nil)
 	malloryReq.Header.Set("X-User-ID", "mallory")
+	malloryReq.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	malloryResp, err := client.Do(malloryReq)
 	if err != nil {
@@ -108,19 +122,19 @@ func TestCreateAndGetConversationFlow(t *testing.T) {
 }
 
 func TestSendMessageAndSyncFlow(t *testing.T) {
+	cfg := testCfg()
 	repo := repository.NewMemoryRepository()
 	memCache := cache.NewMemoryCache()
 	publisher := kafka.NewMemoryPublisher(nil)
-	hub := websocket.NewHub(memCache, nil)
+	hub := websocket.NewHub(cfg, memCache, nil)
 	svc := service.New(repo, publisher, hub)
-	h := New(repo, svc, hub, memCache, publisher, "test-secret")
+	h := New(cfg, repo, svc, hub, memCache, publisher)
 
 	server := httptest.NewServer(h.Routes())
 	defer server.Close()
 
 	client := &http.Client{}
 
-	// Create conversation first
 	c, _ := svc.CreateConversation(context.Background(), "john", "direct", []string{"sarah"})
 
 	// Send normal text message
@@ -132,6 +146,7 @@ func TestSendMessageAndSyncFlow(t *testing.T) {
 	sendReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/conversations/"+c.ID+"/messages", bytes.NewBuffer(msgBody))
 	sendReq.Header.Set("Content-Type", "application/json")
 	sendReq.Header.Set("X-User-ID", "john")
+	sendReq.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	sendResp, err := client.Do(sendReq)
 	if err != nil {
@@ -155,6 +170,7 @@ func TestSendMessageAndSyncFlow(t *testing.T) {
 	shareReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/conversations/"+c.ID+"/messages", bytes.NewBuffer(shareBody))
 	shareReq.Header.Set("Content-Type", "application/json")
 	shareReq.Header.Set("X-User-ID", "john")
+	shareReq.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	shareResp, err := client.Do(shareReq)
 	if err != nil {
@@ -173,6 +189,7 @@ func TestSendMessageAndSyncFlow(t *testing.T) {
 	// Sync messages as Sarah
 	syncReq, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/conversations/"+c.ID+"/messages", nil)
 	syncReq.Header.Set("X-User-ID", "sarah")
+	syncReq.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	syncResp, err := client.Do(syncReq)
 	if err != nil {
@@ -192,12 +209,13 @@ func TestSendMessageAndSyncFlow(t *testing.T) {
 }
 
 func TestMarkReadAndDeleteEndpoints(t *testing.T) {
+	cfg := testCfg()
 	repo := repository.NewMemoryRepository()
 	memCache := cache.NewMemoryCache()
 	publisher := kafka.NewMemoryPublisher(nil)
-	hub := websocket.NewHub(memCache, nil)
+	hub := websocket.NewHub(cfg, memCache, nil)
 	svc := service.New(repo, publisher, hub)
-	h := New(repo, svc, hub, memCache, publisher, "test-secret")
+	h := New(cfg, repo, svc, hub, memCache, publisher)
 
 	server := httptest.NewServer(h.Routes())
 	defer server.Close()
@@ -213,6 +231,7 @@ func TestMarkReadAndDeleteEndpoints(t *testing.T) {
 	// Mark read
 	readReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/conversations/"+c.ID+"/messages/"+msg.ID+"/read", nil)
 	readReq.Header.Set("X-User-ID", "sarah")
+	readReq.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	readResp, err := client.Do(readReq)
 	if err != nil {
@@ -225,6 +244,7 @@ func TestMarkReadAndDeleteEndpoints(t *testing.T) {
 	// Delete message
 	delReq, _ := http.NewRequest(http.MethodDelete, server.URL+"/api/v1/conversations/"+c.ID+"/messages/"+msg.ID, nil)
 	delReq.Header.Set("X-User-ID", "john")
+	delReq.Header.Set("X-Gateway-Secret", cfg.GatewaySecret)
 
 	delResp, err := client.Do(delReq)
 	if err != nil {
@@ -236,18 +256,18 @@ func TestMarkReadAndDeleteEndpoints(t *testing.T) {
 }
 
 func TestUnauthenticatedRequest(t *testing.T) {
+	cfg := testCfg()
 	repo := repository.NewMemoryRepository()
 	memCache := cache.NewMemoryCache()
 	publisher := kafka.NewMemoryPublisher(nil)
-	hub := websocket.NewHub(memCache, nil)
+	hub := websocket.NewHub(cfg, memCache, nil)
 	svc := service.New(repo, publisher, hub)
-	h := New(repo, svc, hub, memCache, publisher, "test-secret")
+	h := New(cfg, repo, svc, hub, memCache, publisher)
 
 	server := httptest.NewServer(h.Routes())
 	defer server.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/conversations", nil)
-	// Missing X-User-ID and Authorization header
 
 	client := &http.Client{}
 	resp, err := client.Do(req)

@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/lukmi/messaging-service/internal/config"
 	"github.com/lukmi/messaging-service/internal/response"
 )
 
@@ -21,12 +24,14 @@ const (
 	RequestIDKey contextKey = "request_id"
 )
 
-func Auth(jwtSecret string, logger *slog.Logger) func(http.Handler) http.Handler {
-	secretBytes := []byte(jwtSecret)
+var validUserIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.\@]{1,64}$`)
+
+func Auth(cfg *config.Config, logger *slog.Logger) func(http.Handler) http.Handler {
+	secretBytes := []byte(cfg.JWTSecret)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip auth for health endpoints
+			// Skip auth for health probes
 			path := r.URL.Path
 			if path == "/healthz" || path == "/readyz" {
 				next.ServeHTTP(w, r)
@@ -35,45 +40,63 @@ func Auth(jwtSecret string, logger *slog.Logger) func(http.Handler) http.Handler
 
 			var userID string
 
-			// 1. Check X-User-ID header (passed by trusted API Gateway)
-			if headerUserID := r.Header.Get("X-User-ID"); headerUserID != "" {
-				userID = headerUserID
-			}
+			// 1. Gateway Contract Authentication (X-User-ID + X-Gateway-Secret)
+			headerUserID := r.Header.Get("X-User-ID")
+			headerGatewaySecret := r.Header.Get("X-Gateway-Secret")
 
-			// 2. Check Authorization Bearer token or URL query token (for WS)
-			authHeader := r.Header.Get("Authorization")
-			tokenStr := ""
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
-			} else if queryToken := r.URL.Query().Get("token"); queryToken != "" {
-				tokenStr = queryToken
-			}
-
-			if userID == "" && tokenStr != "" {
-				// Parse JWT token if available
-				token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-					if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-						return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			if headerUserID != "" {
+				if cfg.GatewaySecret != "" && headerGatewaySecret == cfg.GatewaySecret {
+					if validUserIDRegex.MatchString(headerUserID) {
+						userID = headerUserID
+					} else {
+						response.Error(w, http.StatusBadRequest, "invalid user id format")
+						return
 					}
-					return secretBytes, nil
-				})
+				} else if cfg.GatewaySecret != "" {
+					response.Error(w, http.StatusUnauthorized, "unauthorized: invalid or missing gateway secret")
+					return
+				}
+			}
 
-				if err == nil && token.Valid {
-					if claims, ok := token.Claims.(jwt.MapClaims); ok {
-						if sub, ok := claims["sub"].(string); ok && sub != "" {
-							userID = sub
-						} else if uid, ok := claims["user_id"].(string); ok && uid != "" {
-							userID = uid
+			// 2. Direct Signed JWT Authentication (Bearer Header or WS Query Parameter)
+			if userID == "" {
+				authHeader := r.Header.Get("Authorization")
+				tokenStr := ""
+
+				if strings.HasPrefix(authHeader, "Bearer ") {
+					tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+				} else if queryToken := r.URL.Query().Get("token"); queryToken != "" {
+					tokenStr = queryToken
+				}
+
+				if tokenStr != "" {
+					parsedToken, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+						// Reject 'none' and non-HMAC signing methods
+						if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+							return nil, fmt.Errorf("unexpected signing algorithm: %v", token.Header["alg"])
+						}
+						return secretBytes, nil
+					}, jwt.WithExpirationRequired())
+
+					if err == nil && parsedToken.Valid {
+						if claims, ok := parsedToken.Claims.(jwt.MapClaims); ok {
+							var candidateID string
+							if sub, ok := claims["sub"].(string); ok && sub != "" {
+								candidateID = sub
+							} else if uid, ok := claims["user_id"].(string); ok && uid != "" {
+								candidateID = uid
+							}
+
+							if candidateID != "" && validUserIDRegex.MatchString(candidateID) {
+								userID = candidateID
+							}
 						}
 					}
-				} else if userID == "" {
-					// Fallback for simple Bearer token in development/test mode
-					userID = tokenStr
 				}
 			}
 
 			if userID == "" {
-				response.Error(w, http.StatusUnauthorized, "unauthorized: valid authentication required")
+				response.Error(w, http.StatusUnauthorized, "unauthorized: valid authentication credentials required")
 				return
 			}
 
@@ -117,9 +140,12 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 			reqID, _ := r.Context().Value(RequestIDKey).(string)
 			userID, _ := r.Context().Value(UserIDKey).(string)
 
+			// Sanitize and redact sensitive query params (e.g. token) from request URL before logging
+			sanitizedPath := sanitizeURLPath(r.URL)
+
 			logger.Info("http request",
 				"method", r.Method,
-				"path", r.URL.Path,
+				"path", sanitizedPath,
 				"status", wrapped.statusCode,
 				"duration_ms", duration.Milliseconds(),
 				"request_id", reqID,
@@ -127,6 +153,18 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 			)
 		})
 	}
+}
+
+func sanitizeURLPath(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	query := u.Query()
+	if query.Has("token") {
+		query.Set("token", "[REDACTED]")
+		return u.Path + "?" + query.Encode()
+	}
+	return u.RequestURI()
 }
 
 type responseWriterWrapper struct {

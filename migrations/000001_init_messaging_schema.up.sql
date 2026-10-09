@@ -1,5 +1,6 @@
--- Lukmi Messaging Service PostgreSQL Migration
--- central repository: lukmi-database
+-- Central Lukmi Database Schema Migration for Messaging Service
+-- Owner Repository: https://github.com/functionor/lukmi_database
+-- Destination Path: migrations/000001_init_messaging_schema.up.sql
 
 CREATE TABLE IF NOT EXISTS conversations (
     conversation_id VARCHAR(64) PRIMARY KEY,
@@ -40,8 +41,8 @@ CREATE TABLE IF NOT EXISTS message_reads (
     PRIMARY KEY (message_id, user_id)
 );
 
--- Indexes for performant message querying, pagination, and idempotency
-CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages (conversation_id, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conversation_client_id ON messages (conversation_id, client_message_id) WHERE client_message_id IS NOT NULL;
+-- Compound Keyset Pagination & Idempotency Indexes
+CREATE INDEX IF NOT EXISTS idx_messages_conv_created_id ON messages (conversation_id, created_at DESC, message_id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conversation_client_id ON messages (conversation_id, client_message_id) WHERE client_message_id IS NOT NULL AND client_message_id != '';
 CREATE INDEX IF NOT EXISTS idx_conversation_members_user ON conversation_members (user_id) WHERE left_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_message_reads_conv_user ON message_reads (conversation_id, user_id);

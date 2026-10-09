@@ -3,8 +3,12 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -30,65 +34,18 @@ func NewPostgresRepository(cfg *config.Config) (*PostgresRepository, error) {
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("failed to ping postgres: %w", err)
 	}
 
-	repo := &PostgresRepository{db: db}
-	if err := repo.initTables(ctx); err != nil {
-		return nil, fmt.Errorf("failed to initialize postgres tables: %w", err)
-	}
-
-	return repo, nil
+	return &PostgresRepository{db: db}, nil
 }
 
-func (p *PostgresRepository) initTables(ctx context.Context) error {
-	query := `
-	CREATE TABLE IF NOT EXISTS conversations (
-		conversation_id VARCHAR(64) PRIMARY KEY,
-		conversation_type VARCHAR(32) NOT NULL DEFAULT 'direct',
-		created_by VARCHAR(64) NOT NULL,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-
-	CREATE TABLE IF NOT EXISTS conversation_members (
-		conversation_id VARCHAR(64) NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-		user_id VARCHAR(64) NOT NULL,
-		joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		left_at TIMESTAMPTZ,
-		PRIMARY KEY (conversation_id, user_id)
-	);
-
-	CREATE TABLE IF NOT EXISTS messages (
-		message_id VARCHAR(64) PRIMARY KEY,
-		conversation_id VARCHAR(64) NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-		sender_id VARCHAR(64) NOT NULL,
-		message_type VARCHAR(32) NOT NULL,
-		text_content TEXT,
-		media_id VARCHAR(128),
-		reference_id VARCHAR(128),
-		ciphertext TEXT,
-		client_message_id VARCHAR(128),
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		deleted_at TIMESTAMPTZ
-	);
-
-	CREATE TABLE IF NOT EXISTS message_reads (
-		message_id VARCHAR(64) NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
-		user_id VARCHAR(64) NOT NULL,
-		read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		conversation_id VARCHAR(64) NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-		PRIMARY KEY (message_id, user_id)
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages (conversation_id, created_at DESC);
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conversation_client_id ON messages (conversation_id, client_message_id) WHERE client_message_id IS NOT NULL AND client_message_id != '';
-	CREATE INDEX IF NOT EXISTS idx_conversation_members_user ON conversation_members (user_id) WHERE left_at IS NULL;
-	CREATE INDEX IF NOT EXISTS idx_message_reads_conv_user ON message_reads (conversation_id, user_id);
-	`
-	_, err := p.db.ExecContext(ctx, query)
-	return err
+func (p *PostgresRepository) Close() error {
+	if p.db != nil {
+		return p.db.Close()
+	}
+	return nil
 }
 
 func (p *PostgresRepository) Ping(ctx context.Context) error {
@@ -150,22 +107,48 @@ func (p *PostgresRepository) GetConversation(ctx context.Context, id string) (*m
 	return &c, nil
 }
 
-func (p *PostgresRepository) ListConversations(ctx context.Context, userID string, cursor string, limit int) ([]*model.Conversation, error) {
+func (p *PostgresRepository) ListConversations(ctx context.Context, userID string, cursor string, limit int) ([]*model.Conversation, string, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
 
-	query := `
-		SELECT c.conversation_id, c.conversation_type, c.created_by, c.created_at, c.updated_at
-		FROM conversations c
-		JOIN conversation_members cm ON c.conversation_id = cm.conversation_id
-		WHERE cm.user_id = $1 AND cm.left_at IS NULL
-		ORDER BY c.updated_at DESC
-		LIMIT $2
-	`
-	rows, err := p.db.QueryContext(ctx, query, userID, limit)
+	var cursorTime time.Time
+	var cursorID string
+	var err error
+
+	if cursor != "" {
+		cursorTime, cursorID, err = DecodeCursor(cursor)
+		if err != nil {
+			return nil, "", ErrInvalidCursor
+		}
+	}
+
+	var rows *sql.Rows
+	if !cursorTime.IsZero() {
+		query := `
+			SELECT c.conversation_id, c.conversation_type, c.created_by, c.created_at, c.updated_at
+			FROM conversations c
+			JOIN conversation_members cm ON c.conversation_id = cm.conversation_id
+			WHERE cm.user_id = $1 AND cm.left_at IS NULL
+			  AND (c.updated_at, c.conversation_id) < ($2, $3)
+			ORDER BY c.updated_at DESC, c.conversation_id DESC
+			LIMIT $4
+		`
+		rows, err = p.db.QueryContext(ctx, query, userID, cursorTime, cursorID, limit)
+	} else {
+		query := `
+			SELECT c.conversation_id, c.conversation_type, c.created_by, c.created_at, c.updated_at
+			FROM conversations c
+			JOIN conversation_members cm ON c.conversation_id = cm.conversation_id
+			WHERE cm.user_id = $1 AND cm.left_at IS NULL
+			ORDER BY c.updated_at DESC, c.conversation_id DESC
+			LIMIT $2
+		`
+		rows, err = p.db.QueryContext(ctx, query, userID, limit)
+	}
+
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer rows.Close()
 
@@ -173,11 +156,21 @@ func (p *PostgresRepository) ListConversations(ctx context.Context, userID strin
 	for rows.Next() {
 		var c model.Conversation
 		if err := rows.Scan(&c.ID, &c.Type, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		convs = append(convs, &c)
 	}
-	return convs, nil
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+
+	var nextCursor string
+	if len(convs) == limit {
+		last := convs[len(convs)-1]
+		nextCursor = EncodeCursor(last.UpdatedAt, last.ID)
+	}
+
+	return convs, nextCursor, nil
 }
 
 func (p *PostgresRepository) Members(ctx context.Context, conversationID string) ([]string, error) {
@@ -200,8 +193,11 @@ func (p *PostgresRepository) Members(ctx context.Context, conversationID string)
 		}
 		users = append(users, uid)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
 	if len(users) == 0 {
-		// Verify if conversation exists
 		if _, err := p.GetConversation(ctx, conversationID); err != nil {
 			return nil, err
 		}
@@ -252,8 +248,7 @@ func (p *PostgresRepository) LeaveConversation(ctx context.Context, conversation
 	return nil
 }
 
-func (p *PostgresRepository) CreateMessage(ctx context.Context, m *model.Message) (*model.Message, error) {
-	// If client_message_id is supplied, check for existing idempotency match
+func (p *PostgresRepository) CreateMessageWithOutbox(ctx context.Context, m *model.Message, event *model.Event) (*model.Message, error) {
 	if m.ClientID != "" {
 		existing, err := p.GetMessageByClientID(ctx, m.ConversationID, m.ClientID)
 		if err == nil && existing != nil {
@@ -291,6 +286,23 @@ func (p *PostgresRepository) CreateMessage(ctx context.Context, m *model.Message
 	// Update conversation updated_at timestamp
 	_, _ = tx.ExecContext(ctx, `UPDATE conversations SET updated_at = $1 WHERE conversation_id = $2`, m.CreatedAt, m.ConversationID)
 
+	// Transactional Outbox Event insertion
+	if event != nil {
+		payloadBytes, err := json.Marshal(event)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal outbox event payload: %w", err)
+		}
+
+		outboxQuery := `
+			INSERT INTO outbox_events (event_id, event_type, aggregate_type, aggregate_id, payload, status, created_at)
+			VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+		`
+		_, err = tx.ExecContext(ctx, outboxQuery, event.ID, string(event.Type), "message", m.ID, payloadBytes, event.OccurredAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to insert outbox event: %w", err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -322,25 +334,35 @@ func (p *PostgresRepository) GetMessageByClientID(ctx context.Context, conversat
 	return scanMessage(row)
 }
 
-func (p *PostgresRepository) ListMessages(ctx context.Context, conversationID string, cursor string, limit int) ([]*model.Message, error) {
+func (p *PostgresRepository) ListMessages(ctx context.Context, conversationID string, cursor string, limit int) ([]*model.Message, string, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
 
-	var rows *sql.Rows
+	var cursorTime time.Time
+	var cursorID string
 	var err error
 
 	if cursor != "" {
+		cursorTime, cursorID, err = DecodeCursor(cursor)
+		if err != nil {
+			return nil, "", ErrInvalidCursor
+		}
+	}
+
+	var rows *sql.Rows
+
+	if !cursorTime.IsZero() {
 		query := `
 			SELECT message_id, conversation_id, sender_id, message_type,
 			       COALESCE(text_content, ''), COALESCE(media_id, ''), COALESCE(reference_id, ''), COALESCE(ciphertext, ''),
 			       COALESCE(client_message_id, ''), created_at, updated_at, deleted_at
 			FROM messages
-			WHERE conversation_id = $1 AND created_at < (SELECT created_at FROM messages WHERE message_id = $2)
-			ORDER BY created_at DESC
-			LIMIT $3
+			WHERE conversation_id = $1 AND (created_at, message_id) < ($2, $3)
+			ORDER BY created_at DESC, message_id DESC
+			LIMIT $4
 		`
-		rows, err = p.db.QueryContext(ctx, query, conversationID, cursor, limit)
+		rows, err = p.db.QueryContext(ctx, query, conversationID, cursorTime, cursorID, limit)
 	} else {
 		query := `
 			SELECT message_id, conversation_id, sender_id, message_type,
@@ -348,14 +370,14 @@ func (p *PostgresRepository) ListMessages(ctx context.Context, conversationID st
 			       COALESCE(client_message_id, ''), created_at, updated_at, deleted_at
 			FROM messages
 			WHERE conversation_id = $1
-			ORDER BY created_at DESC
+			ORDER BY created_at DESC, message_id DESC
 			LIMIT $2
 		`
 		rows, err = p.db.QueryContext(ctx, query, conversationID, limit)
 	}
 
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer rows.Close()
 
@@ -363,33 +385,83 @@ func (p *PostgresRepository) ListMessages(ctx context.Context, conversationID st
 	for rows.Next() {
 		m, err := scanMessageFromRows(rows)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		msgs = append(msgs, m)
 	}
-	return msgs, nil
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+
+	var nextCursor string
+	if len(msgs) == limit {
+		last := msgs[len(msgs)-1]
+		nextCursor = EncodeCursor(last.CreatedAt, last.ID)
+	}
+
+	return msgs, nextCursor, nil
 }
 
-func (p *PostgresRepository) MarkRead(ctx context.Context, read *model.MessageRead) (*model.MessageRead, error) {
+func (p *PostgresRepository) MarkReadWithOutbox(ctx context.Context, read *model.MessageRead, event *model.Event) (*model.MessageRead, error) {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Enforce that message_id exists and belongs to conversation_id
+	var exists int
+	checkQuery := `SELECT 1 FROM messages WHERE message_id = $1 AND conversation_id = $2`
+	if err := tx.QueryRowContext(ctx, checkQuery, read.MessageID, read.ConversationID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
 	query := `
 		INSERT INTO message_reads (message_id, user_id, read_at, conversation_id)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (message_id, user_id) DO UPDATE SET read_at = EXCLUDED.read_at
 	`
-	_, err := p.db.ExecContext(ctx, query, read.MessageID, read.UserID, read.ReadAt, read.ConversationID)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, query, read.MessageID, read.UserID, read.ReadAt, read.ConversationID); err != nil {
 		return nil, err
 	}
+
+	if event != nil {
+		payloadBytes, err := json.Marshal(event)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal outbox event: %w", err)
+		}
+		outboxQuery := `
+			INSERT INTO outbox_events (event_id, event_type, aggregate_type, aggregate_id, payload, status, created_at)
+			VALUES ($1, $2, 'message_read', $3, $4, 'pending', $5)
+		`
+		if _, err := tx.ExecContext(ctx, outboxQuery, event.ID, string(event.Type), read.MessageID, payloadBytes, event.OccurredAt); err != nil {
+			return nil, fmt.Errorf("failed to insert read outbox event: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	return read, nil
 }
 
-func (p *PostgresRepository) DeleteMessage(ctx context.Context, conversationID, messageID, userID string) error {
+func (p *PostgresRepository) DeleteMessageWithOutbox(ctx context.Context, conversationID, messageID, userID string, event *model.Event) error {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	query := `
 		UPDATE messages
 		SET deleted_at = NOW()
 		WHERE conversation_id = $1 AND message_id = $2 AND sender_id = $3 AND deleted_at IS NULL
 	`
-	res, err := p.db.ExecContext(ctx, query, conversationID, messageID, userID)
+	res, err := tx.ExecContext(ctx, query, conversationID, messageID, userID)
 	if err != nil {
 		return err
 	}
@@ -398,7 +470,6 @@ func (p *PostgresRepository) DeleteMessage(ctx context.Context, conversationID, 
 		return err
 	}
 	if rows == 0 {
-		// Check if message exists or user is not sender
 		m, getErr := p.GetMessageByID(ctx, conversationID, messageID)
 		if getErr != nil {
 			return ErrNotFound
@@ -407,11 +478,82 @@ func (p *PostgresRepository) DeleteMessage(ctx context.Context, conversationID, 
 			return ErrUnauthorized
 		}
 		if m.DeletedAt != nil {
-			return nil // Already deleted
+			return nil
 		}
 		return ErrNotFound
 	}
-	return nil
+
+	if event != nil {
+		payloadBytes, err := json.Marshal(event)
+		if err != nil {
+			return fmt.Errorf("failed to marshal delete outbox event: %w", err)
+		}
+		outboxQuery := `
+			INSERT INTO outbox_events (event_id, event_type, aggregate_type, aggregate_id, payload, status, created_at)
+			VALUES ($1, $2, 'message_deleted', $3, $4, 'pending', $5)
+		`
+		if _, err := tx.ExecContext(ctx, outboxQuery, event.ID, string(event.Type), messageID, payloadBytes, event.OccurredAt); err != nil {
+			return fmt.Errorf("failed to insert delete outbox event: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (p *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*model.Event, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+		SELECT event_id, payload
+		FROM outbox_events
+		WHERE status = 'pending'
+		ORDER BY created_at ASC
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED
+	`
+	rows, err := p.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []*model.Event
+	for rows.Next() {
+		var eventID string
+		var payloadBytes []byte
+		if err := rows.Scan(&eventID, &payloadBytes); err != nil {
+			return nil, err
+		}
+		var evt model.Event
+		if err := json.Unmarshal(payloadBytes, &evt); err == nil {
+			events = append(events, &evt)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func (p *PostgresRepository) MarkOutboxEventPublished(ctx context.Context, eventID string) error {
+	query := `
+		UPDATE outbox_events
+		SET status = 'published', published_at = NOW()
+		WHERE event_id = $1
+	`
+	_, err := p.db.ExecContext(ctx, query, eventID)
+	return err
+}
+
+func (p *PostgresRepository) RecordOutboxEventFailure(ctx context.Context, eventID string, errMsg string) error {
+	query := `
+		UPDATE outbox_events
+		SET retry_count = retry_count + 1, last_error = $2
+		WHERE event_id = $1
+	`
+	_, err := p.db.ExecContext(ctx, query, eventID, errMsg)
+	return err
 }
 
 func scanMessage(row *sql.Row) (*model.Message, error) {
@@ -435,6 +577,33 @@ func scanMessageFromRows(rows *sql.Rows) (*model.Message, error) {
 	}
 	m.Type = model.MessageType(msgType)
 	return &m, nil
+}
+
+func EncodeCursor(t time.Time, id string) string {
+	if t.IsZero() || id == "" {
+		return ""
+	}
+	raw := fmt.Sprintf("%d:%s", t.UnixNano(), id)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+func DecodeCursor(cursor string) (time.Time, string, error) {
+	if cursor == "" {
+		return time.Time{}, "", nil
+	}
+	decodedBytes, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("invalid base64 cursor: %w", err)
+	}
+	parts := strings.SplitN(string(decodedBytes), ":", 2)
+	if len(parts) != 2 {
+		return time.Time{}, "", fmt.Errorf("invalid cursor format")
+	}
+	nanos, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("invalid cursor timestamp")
+	}
+	return time.Unix(0, nanos).UTC(), parts[1], nil
 }
 
 func nilIfEmpty(s string) *string {

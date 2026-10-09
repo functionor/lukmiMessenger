@@ -3,11 +3,13 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/lukmi/messaging-service/internal/cache"
+	"github.com/lukmi/messaging-service/internal/config"
 	"github.com/lukmi/messaging-service/internal/kafka"
 	"github.com/lukmi/messaging-service/internal/middleware"
 	"github.com/lukmi/messaging-service/internal/model"
@@ -17,23 +19,25 @@ import (
 	"github.com/lukmi/messaging-service/internal/websocket"
 )
 
+const MaxBodyBytes = 1024 * 1024 // 1 MB payload limit
+
 type Handler struct {
+	cfg       *config.Config
 	repo      repository.Repository
 	service   *service.Service
 	hub       *websocket.Hub
 	cache     cache.Cache
 	publisher kafka.EventPublisher
-	jwtSecret string
 }
 
-func New(repo repository.Repository, svc *service.Service, hub *websocket.Hub, c cache.Cache, publisher kafka.EventPublisher, jwtSecret string) *Handler {
+func New(cfg *config.Config, repo repository.Repository, svc *service.Service, hub *websocket.Hub, c cache.Cache, publisher kafka.EventPublisher) *Handler {
 	return &Handler{
+		cfg:       cfg,
 		repo:      repo,
 		service:   svc,
 		hub:       hub,
 		cache:     c,
 		publisher: publisher,
-		jwtSecret: jwtSecret,
 	}
 }
 
@@ -46,7 +50,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/api/v1/conversations", h.conversations)
 	mux.HandleFunc("/api/v1/conversations/", h.conversation)
 
-	authMiddleware := middleware.Auth(h.jwtSecret, nil)
+	authMiddleware := middleware.Auth(h.cfg, nil)
 	return middleware.RequestID(authMiddleware(mux))
 }
 
@@ -56,14 +60,8 @@ func (h *Handler) healthz(w http.ResponseWriter, _ *http.Request) {
 
 func (h *Handler) readyz(w http.ResponseWriter, r *http.Request) {
 	if err := h.repo.Ping(r.Context()); err != nil {
-		response.Error(w, http.StatusServiceUnavailable, "database unready: "+err.Error())
+		response.Error(w, http.StatusServiceUnavailable, "database connection unready")
 		return
-	}
-	if h.cache != nil {
-		if err := h.cache.Ping(r.Context()); err != nil {
-			response.Error(w, http.StatusServiceUnavailable, "cache unready: "+err.Error())
-			return
-		}
 	}
 	response.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
@@ -78,12 +76,13 @@ func (h *Handler) conversations(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 		var input struct {
 			Type      string   `json:"conversation_type"`
 			MemberIDs []string `json:"member_ids"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-			response.Error(w, http.StatusBadRequest, "invalid request body")
+			response.Error(w, http.StatusBadRequest, "invalid conversation json payload")
 			return
 		}
 		conv, err := h.service.CreateConversation(r.Context(), userID, input.Type, input.MemberIDs)
@@ -94,14 +93,24 @@ func (h *Handler) conversations(w http.ResponseWriter, r *http.Request) {
 		response.JSON(w, http.StatusCreated, conv)
 
 	case http.MethodGet:
-		limit := getIntQuery(r, "limit", 50)
+		limit, err := parseLimit(r.URL.Query().Get("limit"), 50)
+		if err != nil {
+			response.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		cursor := r.URL.Query().Get("cursor")
-		convs, err := h.service.ListConversations(r.Context(), userID, cursor, limit)
+
+		convs, nextCursor, err := h.service.ListConversations(r.Context(), userID, cursor, limit)
 		if err != nil {
 			h.writeError(w, err)
 			return
 		}
-		response.JSON(w, http.StatusOK, map[string]any{"conversations": convs})
+
+		res := map[string]any{"conversations": convs}
+		if nextCursor != "" {
+			res["next_cursor"] = nextCursor
+		}
+		response.JSON(w, http.StatusOK, res)
 
 	default:
 		response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -119,7 +128,6 @@ func (h *Handler) conversation(w http.ResponseWriter, r *http.Request) {
 
 	conversationID := parts[3]
 
-	// Base conversation endpoint: GET /api/v1/conversations/{id}
 	if len(parts) == 4 {
 		if r.Method == http.MethodGet {
 			conv, err := h.service.GetConversation(r.Context(), userID, conversationID)
@@ -134,7 +142,6 @@ func (h *Handler) conversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sub-resource routes under /api/v1/conversations/{id}/...
 	switch parts[4] {
 	case "members":
 		if r.Method == http.MethodGet {
@@ -164,6 +171,7 @@ func (h *Handler) conversation(w http.ResponseWriter, r *http.Request) {
 
 	case "read":
 		if r.Method == http.MethodPost {
+			r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 			var input struct {
 				MessageID string `json:"message_id"`
 			}
@@ -191,16 +199,27 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request, userID,
 	if len(subParts) == 0 {
 		switch r.Method {
 		case http.MethodGet:
-			limit := getIntQuery(r, "limit", 50)
+			limit, err := parseLimit(r.URL.Query().Get("limit"), 50)
+			if err != nil {
+				response.Error(w, http.StatusBadRequest, err.Error())
+				return
+			}
 			cursor := r.URL.Query().Get("cursor")
-			messages, err := h.service.SyncMessages(r.Context(), userID, conversationID, cursor, limit)
+
+			messages, nextCursor, err := h.service.SyncMessages(r.Context(), userID, conversationID, cursor, limit)
 			if err != nil {
 				h.writeError(w, err)
 				return
 			}
-			response.JSON(w, http.StatusOK, map[string]any{"messages": messages})
+
+			res := map[string]any{"messages": messages}
+			if nextCursor != "" {
+				res["next_cursor"] = nextCursor
+			}
+			response.JSON(w, http.StatusOK, res)
 
 		case http.MethodPost:
+			r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 			var input model.Message
 			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 				response.Error(w, http.StatusBadRequest, "invalid message json body")
@@ -259,7 +278,7 @@ func (h *Handler) writeError(w http.ResponseWriter, err error) {
 		response.Error(w, http.StatusForbidden, "access denied: not a conversation member")
 	case errors.Is(err, repository.ErrUnauthorized):
 		response.Error(w, http.StatusForbidden, "unauthorized operation")
-	case errors.Is(err, service.ErrInvalidMessage), errors.Is(err, service.ErrInvalidReference):
+	case errors.Is(err, service.ErrInvalidMessage), errors.Is(err, service.ErrInvalidReference), errors.Is(err, repository.ErrInvalidCursor):
 		response.Error(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, repository.ErrAlreadyExists):
 		response.Error(w, http.StatusConflict, "resource already exists")
@@ -268,11 +287,13 @@ func (h *Handler) writeError(w http.ResponseWriter, err error) {
 	}
 }
 
-func getIntQuery(r *http.Request, key string, fallback int) int {
-	if val := r.URL.Query().Get(key); val != "" {
-		if i, err := strconv.Atoi(val); err == nil && i > 0 && i <= 100 {
-			return i
-		}
+func parseLimit(raw string, fallback int) (int, error) {
+	if raw == "" {
+		return fallback, nil
 	}
-	return fallback
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit <= 0 || limit > 100 {
+		return 0, fmt.Errorf("invalid limit parameter: must be integer between 1 and 100")
+	}
+	return limit, nil
 }

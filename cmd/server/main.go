@@ -21,56 +21,87 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("failed to load configuration", "error", err)
+		os.Exit(1)
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 
-	logger.Info("starting lukmi messaging service", "env", cfg.Env, "port", cfg.Port)
+	logger.Info("starting lukmi messaging service", "env", cfg.Env, "port", cfg.Port, "config", cfg.Redact())
 
-	// 1. Initialize Repository (PostgreSQL with Memory fallback)
+	// 1. Initialize Repository (PostgreSQL)
 	var repo repository.Repository
-	pgRepo, err := repository.NewPostgresRepository(cfg)
+	var pgRepo *repository.PostgresRepository
+	pgRepo, err = repository.NewPostgresRepository(cfg)
 	if err != nil {
-		logger.Warn("postgres unavailable, using memory repository fallback", "error", err)
+		if cfg.IsProduction() {
+			logger.Error("production error: postgresql repository connection failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Warn("postgresql unavailable in development mode, falling back to memory repository", "error", err)
 		repo = repository.NewMemoryRepository()
 	} else {
 		logger.Info("connected to postgresql database")
 		repo = pgRepo
+		defer pgRepo.Close()
 	}
 
-	// 2. Initialize Cache (Redis with Memory fallback)
+	// 2. Initialize Cache (Redis)
 	var c cache.Cache
 	redisCache, err := cache.NewRedisCache(cfg.RedisURL, logger)
 	if err != nil {
-		logger.Warn("redis unavailable, using memory cache fallback", "error", err)
-		c = cache.NewMemoryCache()
+		if cfg.IsProduction() {
+			logger.Warn("redis cache unavailable in production mode, running in degraded single-instance cache mode", "error", err)
+			c = cache.NewMemoryCache()
+		} else {
+			logger.Warn("redis unavailable in development mode, falling back to memory cache", "error", err)
+			c = cache.NewMemoryCache()
+		}
 	} else {
-		logger.Info("connected to redis")
+		logger.Info("connected to redis cache")
 		c = redisCache
 	}
 
-	// 3. Initialize Kafka Event Publisher (Redpanda/Kafka with Memory fallback)
+	// 3. Initialize Kafka Event Publisher (Redpanda/Kafka)
 	var publisher kafka.EventPublisher
 	producer, err := kafka.NewProducer(cfg.RedpandaBrokers, cfg.KafkaTopic, logger)
 	if err != nil {
-		logger.Warn("kafka producer unavailable, using memory publisher fallback", "error", err)
-		publisher = kafka.NewMemoryPublisher(logger)
+		if cfg.IsProduction() {
+			logger.Warn("kafka producer connection degraded, outbox processor will buffer events in postgresql until connected", "error", err)
+			publisher = kafka.NewMemoryPublisher(logger)
+		} else {
+			logger.Warn("kafka producer unavailable in development mode, falling back to memory publisher", "error", err)
+			publisher = kafka.NewMemoryPublisher(logger)
+		}
 	} else {
 		logger.Info("connected to kafka/redpanda producer", "brokers", cfg.RedpandaBrokers, "topic", cfg.KafkaTopic)
 		publisher = producer
+		defer producer.Close()
 	}
 
-	// 4. Initialize WebSocket Hub
-	hub := websocket.NewHub(c, logger)
+	// 4. Initialize Outbox Event Processor for reliable Kafka event delivery
+	outboxProcessor := kafka.NewOutboxProcessor(repo, publisher, logger, 500*time.Millisecond)
+	outboxCtx, cancelOutbox := context.WithCancel(context.Background())
+	outboxProcessor.Start(outboxCtx)
+	defer func() {
+		cancelOutbox()
+		outboxProcessor.Stop()
+	}()
 
-	// 5. Initialize Core Domain Service
+	// 5. Initialize WebSocket Hub
+	hub := websocket.NewHub(cfg, c, logger)
+	defer hub.Close()
+
+	// 6. Initialize Core Service
 	svc := service.New(repo, publisher, hub)
 
-	// 6. Construct HTTP Handler & Routes
-	handler := httpapi.New(repo, svc, hub, c, publisher, cfg.JWTSecret)
+	// 7. Construct HTTP Handler & Routes
+	handler := httpapi.New(cfg, repo, svc, hub, c, publisher)
 	handlerWithMiddleware := middleware.Logging(logger)(handler.Routes())
 
 	server := &http.Server{
@@ -82,20 +113,19 @@ func main() {
 		IdleTimeout:       cfg.IdleTimeout,
 	}
 
-	// 7. Start HTTP Server
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// 8. Start HTTP Server with Graceful Shutdown
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		logger.Info("server listening", "addr", server.Addr)
+		logger.Info("messaging server listening", "addr", server.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("server stopped unexpectedly", "error", err)
+			logger.Error("messaging server stopped unexpectedly", "error", err)
 			os.Exit(1)
 		}
 	}()
 
-	// 8. Graceful Shutdown
-	<-ctx.Done()
+	<-stopCtx.Done()
 	logger.Info("shutting down messaging service gracefully...")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -103,11 +133,6 @@ func main() {
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server forced to shutdown", "error", err)
-	}
-
-	hub.Close()
-	if publisher != nil {
-		_ = publisher.Close()
 	}
 
 	logger.Info("messaging service shutdown complete")
