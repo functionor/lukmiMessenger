@@ -1,178 +1,278 @@
 package httpapi
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/lukmi/messaging-service/internal/cache"
+	"github.com/lukmi/messaging-service/internal/kafka"
+	"github.com/lukmi/messaging-service/internal/middleware"
 	"github.com/lukmi/messaging-service/internal/model"
 	"github.com/lukmi/messaging-service/internal/repository"
+	"github.com/lukmi/messaging-service/internal/response"
 	"github.com/lukmi/messaging-service/internal/service"
 	"github.com/lukmi/messaging-service/internal/websocket"
 )
 
 type Handler struct {
-	repo    repository.Repository
-	service *service.Service
-	hub     *websocket.Hub
+	repo      repository.Repository
+	service   *service.Service
+	hub       *websocket.Hub
+	cache     cache.Cache
+	publisher kafka.EventPublisher
+	jwtSecret string
 }
 
-func New(repo repository.Repository, svc *service.Service, hub *websocket.Hub) *Handler {
-	return &Handler{repo: repo, service: svc, hub: hub}
+func New(repo repository.Repository, svc *service.Service, hub *websocket.Hub, c cache.Cache, publisher kafka.EventPublisher, jwtSecret string) *Handler {
+	return &Handler{
+		repo:      repo,
+		service:   svc,
+		hub:       hub,
+		cache:     c,
+		publisher: publisher,
+		jwtSecret: jwtSecret,
+	}
 }
+
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ready"}) })
+
+	mux.HandleFunc("/healthz", h.healthz)
+	mux.HandleFunc("/readyz", h.readyz)
 	mux.HandleFunc("/api/v1/ws", h.ws)
 	mux.HandleFunc("/api/v1/conversations", h.conversations)
 	mux.HandleFunc("/api/v1/conversations/", h.conversation)
-	return requestID(auth(mux))
+
+	authMiddleware := middleware.Auth(h.jwtSecret, nil)
+	return middleware.RequestID(authMiddleware(mux))
 }
 
-type contextKey string
+func (h *Handler) healthz(w http.ResponseWriter, _ *http.Request) {
+	response.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
 
-const userContextKey contextKey = "user_id"
-
-func auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		userID := r.Header.Get("X-User-ID")
-		if userID == "" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-			userID = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		}
-		if userID == "" {
-			writeJSON(w, 401, map[string]string{"error": "authentication required"})
+func (h *Handler) readyz(w http.ResponseWriter, r *http.Request) {
+	if err := h.repo.Ping(r.Context()); err != nil {
+		response.Error(w, http.StatusServiceUnavailable, "database unready: "+err.Error())
+		return
+	}
+	if h.cache != nil {
+		if err := h.cache.Ping(r.Context()); err != nil {
+			response.Error(w, http.StatusServiceUnavailable, "cache unready: "+err.Error())
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey, userID)))
-	})
+	}
+	response.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
-func currentUser(r *http.Request) string {
-	value, _ := r.Context().Value(userContextKey).(string)
-	return value
+
+func (h *Handler) ws(w http.ResponseWriter, r *http.Request) {
+	userID := middleware.GetUserID(r.Context())
+	h.hub.ServeHTTP(w, r, userID)
 }
-func requestID(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get("X-Request-ID")
-		if id == "" {
-			id = strconv.FormatInt(time.Now().UnixNano(), 10)
-		}
-		w.Header().Set("X-Request-ID", id)
-		next.ServeHTTP(w, r)
-	})
-}
-func (h *Handler) ws(w http.ResponseWriter, r *http.Request) { h.hub.ServeHTTP(w, r, currentUser(r)) }
+
 func (h *Handler) conversations(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
-		return
-	}
-	var input struct {
-		Type      string   `json:"conversation_type"`
-		MemberIDs []string `json:"member_ids"`
-	}
-	if json.NewDecoder(r.Body).Decode(&input) != nil || len(input.MemberIDs) == 0 {
-		writeJSON(w, 400, map[string]string{"error": "invalid conversation"})
-		return
-	}
-	id := strconv.FormatInt(time.Now().UnixNano(), 10)
-	now := time.Now().UTC()
-	c := &model.Conversation{ID: id, Type: input.Type, CreatedBy: currentUser(r), CreatedAt: now, UpdatedAt: now}
-	members := append(input.MemberIDs, currentUser(r))
-	if err := h.repo.CreateConversation(r.Context(), c, members); err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, 201, c)
-}
-func (h *Handler) conversation(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) < 4 {
-		writeJSON(w, 404, map[string]string{"error": "not found"})
-		return
-	}
-	conversationID := parts[3]
-	member, err := h.repo.IsMember(r.Context(), conversationID, currentUser(r))
-	if err != nil || !member {
-		writeJSON(w, 403, map[string]string{"error": "conversation access denied"})
-		return
-	}
-	if len(parts) == 4 && r.Method == http.MethodGet {
-		c, getErr := h.repo.GetConversation(r.Context(), conversationID)
-		if getErr != nil {
-			writeError(w, getErr)
+	userID := middleware.GetUserID(r.Context())
+
+	switch r.Method {
+	case http.MethodPost:
+		var input struct {
+			Type      string   `json:"conversation_type"`
+			MemberIDs []string `json:"member_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			response.Error(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
-		writeJSON(w, 200, c)
+		conv, err := h.service.CreateConversation(r.Context(), userID, input.Type, input.MemberIDs)
+		if err != nil {
+			h.writeError(w, err)
+			return
+		}
+		response.JSON(w, http.StatusCreated, conv)
+
+	case http.MethodGet:
+		limit := getIntQuery(r, "limit", 50)
+		cursor := r.URL.Query().Get("cursor")
+		convs, err := h.service.ListConversations(r.Context(), userID, cursor, limit)
+		if err != nil {
+			h.writeError(w, err)
+			return
+		}
+		response.JSON(w, http.StatusOK, map[string]any{"conversations": convs})
+
+	default:
+		response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *Handler) conversation(w http.ResponseWriter, r *http.Request) {
+	userID := middleware.GetUserID(r.Context())
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+
+	if len(parts) < 4 {
+		response.Error(w, http.StatusNotFound, "resource not found")
 		return
 	}
-	if len(parts) < 5 {
-		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+
+	conversationID := parts[3]
+
+	// Base conversation endpoint: GET /api/v1/conversations/{id}
+	if len(parts) == 4 {
+		if r.Method == http.MethodGet {
+			conv, err := h.service.GetConversation(r.Context(), userID, conversationID)
+			if err != nil {
+				h.writeError(w, err)
+				return
+			}
+			response.JSON(w, http.StatusOK, conv)
+			return
+		}
+		response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+
+	// Sub-resource routes under /api/v1/conversations/{id}/...
 	switch parts[4] {
 	case "members":
-		members, getErr := h.repo.Members(r.Context(), conversationID)
-		if getErr != nil {
-			writeError(w, getErr)
+		if r.Method == http.MethodGet {
+			members, err := h.service.GetMembers(r.Context(), userID, conversationID)
+			if err != nil {
+				h.writeError(w, err)
+				return
+			}
+			response.JSON(w, http.StatusOK, map[string]any{"members": members})
 			return
 		}
-		writeJSON(w, 200, members)
+		response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
+
+	case "leave":
+		if r.Method == http.MethodPost {
+			if err := h.service.LeaveConversation(r.Context(), userID, conversationID); err != nil {
+				h.writeError(w, err)
+				return
+			}
+			response.JSON(w, http.StatusOK, map[string]string{"status": "left_conversation"})
+			return
+		}
+		response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
+
 	case "messages":
-		h.messages(w, r, conversationID)
+		h.handleMessages(w, r, userID, conversationID, parts[5:])
+
+	case "read":
+		if r.Method == http.MethodPost {
+			var input struct {
+				MessageID string `json:"message_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&input)
+			if input.MessageID == "" {
+				response.Error(w, http.StatusBadRequest, "message_id required")
+				return
+			}
+			read, err := h.service.MarkRead(r.Context(), userID, conversationID, input.MessageID)
+			if err != nil {
+				h.writeError(w, err)
+				return
+			}
+			response.JSON(w, http.StatusOK, read)
+			return
+		}
+		response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
+
 	default:
-		writeJSON(w, 404, map[string]string{"error": "not found"})
+		response.Error(w, http.StatusNotFound, "resource not found")
 	}
 }
-func (h *Handler) messages(w http.ResponseWriter, r *http.Request, conversationID string) {
-	if r.Method == http.MethodGet {
-		limit := 50
-		if value, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && value > 0 && value <= 100 {
-			limit = value
+
+func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request, userID, conversationID string, subParts []string) {
+	if len(subParts) == 0 {
+		switch r.Method {
+		case http.MethodGet:
+			limit := getIntQuery(r, "limit", 50)
+			cursor := r.URL.Query().Get("cursor")
+			messages, err := h.service.SyncMessages(r.Context(), userID, conversationID, cursor, limit)
+			if err != nil {
+				h.writeError(w, err)
+				return
+			}
+			response.JSON(w, http.StatusOK, map[string]any{"messages": messages})
+
+		case http.MethodPost:
+			var input model.Message
+			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+				response.Error(w, http.StatusBadRequest, "invalid message json body")
+				return
+			}
+			created, err := h.service.SendMessage(r.Context(), userID, conversationID, input)
+			if err != nil {
+				h.writeError(w, err)
+				return
+			}
+			response.JSON(w, http.StatusCreated, created)
+
+		default:
+			response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
-		messages, err := h.repo.ListMessages(r.Context(), conversationID, r.URL.Query().Get("cursor"), limit)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		writeJSON(w, 200, map[string]any{"messages": messages})
 		return
 	}
-	if r.Method == http.MethodPost {
-		var input model.Message
-		if json.NewDecoder(r.Body).Decode(&input) != nil {
-			writeJSON(w, 400, map[string]string{"error": "invalid message"})
+
+	messageID := subParts[0]
+
+	if len(subParts) == 1 {
+		if r.Method == http.MethodDelete {
+			if err := h.service.DeleteMessage(r.Context(), userID, conversationID, messageID); err != nil {
+				h.writeError(w, err)
+				return
+			}
+			response.JSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 			return
 		}
-		created, err := h.service.SendMessage(r.Context(), currentUser(r), conversationID, input)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		writeJSON(w, 201, created)
+		response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+
+	if len(subParts) == 2 && subParts[1] == "read" {
+		if r.Method == http.MethodPost {
+			read, err := h.service.MarkRead(r.Context(), userID, conversationID, messageID)
+			if err != nil {
+				h.writeError(w, err)
+				return
+			}
+			response.JSON(w, http.StatusOK, read)
+			return
+		}
+		response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	response.Error(w, http.StatusNotFound, "resource not found")
 }
-func writeError(w http.ResponseWriter, err error) {
-	status := 500
-	if errors.Is(err, repository.ErrNotFound) {
-		status = 404
+
+func (h *Handler) writeError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, repository.ErrNotFound):
+		response.Error(w, http.StatusNotFound, "resource not found")
+	case errors.Is(err, repository.ErrNotMember):
+		response.Error(w, http.StatusForbidden, "access denied: not a conversation member")
+	case errors.Is(err, repository.ErrUnauthorized):
+		response.Error(w, http.StatusForbidden, "unauthorized operation")
+	case errors.Is(err, service.ErrInvalidMessage), errors.Is(err, service.ErrInvalidReference):
+		response.Error(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, repository.ErrAlreadyExists):
+		response.Error(w, http.StatusConflict, "resource already exists")
+	default:
+		response.Error(w, http.StatusInternalServerError, "internal server error")
 	}
-	if errors.Is(err, repository.ErrNotMember) {
-		status = 403
-	}
-	if errors.Is(err, service.ErrInvalidMessage) {
-		status = 400
-	}
-	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+
+func getIntQuery(r *http.Request, key string, fallback int) int {
+	if val := r.URL.Query().Get(key); val != "" {
+		if i, err := strconv.Atoi(val); err == nil && i > 0 && i <= 100 {
+			return i
+		}
+	}
+	return fallback
 }

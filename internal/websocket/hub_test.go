@@ -1,5 +1,17 @@
 package websocket
 
-import "testing"
+import (
+	"testing"
 
-func TestHubTracksMultipleDevicesPerUser(t *testing.T) { hub := NewHub(); if hub.Connected("sarah") != 0 { t.Fatal("new hub has an unexpected connection") } }
+	"github.com/lukmi/messaging-service/internal/cache"
+)
+
+func TestHubTracksMultipleDevicesPerUser(t *testing.T) {
+	memCache := cache.NewMemoryCache()
+	hub := NewHub(memCache, nil)
+	defer hub.Close()
+
+	if hub.Connected("sarah") != 0 {
+		t.Fatal("new hub has an unexpected connection")
+	}
+}
