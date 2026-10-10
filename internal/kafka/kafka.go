@@ -129,7 +129,7 @@ func (c *Consumer) Start(ctx context.Context, handler func(ctx context.Context, 
 
 				var event model.Event
 				if err := json.Unmarshal(msg.Value, &event); err != nil {
-					c.logger.Error("error unmarshaling kafka event", "error", err)
+					c.logger.Error("error unmarshaling kafka event payload, dead-lettering message", "error", err)
 					_ = c.reader.CommitMessages(ctx, msg)
 					continue
 				}
@@ -137,7 +137,12 @@ func (c *Consumer) Start(ctx context.Context, handler func(ctx context.Context, 
 				// Durable idempotency check
 				if c.dedup != nil {
 					processed, checkErr := c.dedup.IsEventProcessed(ctx, event.ID)
-					if checkErr == nil && processed {
+					if checkErr != nil {
+						c.logger.Error("failed deduplication check, offset NOT committed for retry", "event_id", event.ID, "error", checkErr)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+					if processed {
 						c.logger.Info("ignoring duplicate kafka event via durable deduplicator", "event_id", event.ID)
 						_ = c.reader.CommitMessages(ctx, msg)
 						continue
@@ -146,11 +151,18 @@ func (c *Consumer) Start(ctx context.Context, handler func(ctx context.Context, 
 
 				if err := handler(ctx, event); err != nil {
 					c.logger.Error("error processing kafka event, offset NOT committed for retry", "event_id", event.ID, "error", err)
+					time.Sleep(1 * time.Second)
 				} else {
 					if c.dedup != nil {
-						_ = c.dedup.MarkEventProcessed(ctx, event.ID, string(event.Type))
+						if markErr := c.dedup.MarkEventProcessed(ctx, event.ID, string(event.Type)); markErr != nil {
+							c.logger.Error("failed to mark event processed, offset NOT committed for retry", "event_id", event.ID, "error", markErr)
+							time.Sleep(1 * time.Second)
+							continue
+						}
 					}
-					_ = c.reader.CommitMessages(ctx, msg)
+					if commitErr := c.reader.CommitMessages(ctx, msg); commitErr != nil {
+						c.logger.Error("failed to commit kafka message offset", "event_id", event.ID, "error", commitErr)
+					}
 				}
 			}
 		}

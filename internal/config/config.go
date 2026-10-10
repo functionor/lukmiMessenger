@@ -51,8 +51,12 @@ func Load() (*Config, error) {
 	env := getEnv("ENV", "development")
 	portStr := getEnv("PORT", "8080")
 
-	// Read APP_DATABASE_URL first (with fallback to DATABASE_URL for dev/test)
-	dbURL := getEnv("APP_DATABASE_URL", getEnv("DATABASE_URL", "postgres://lukmi_app:lukmi_app@localhost:5432/lukmi?sslmode=disable"))
+	appDBURL := os.Getenv("APP_DATABASE_URL")
+	dbURL := appDBURL
+	if dbURL == "" && (env == "development" || env == "test" || env == "testing") {
+		dbURL = getEnv("DATABASE_URL", "postgres://lukmi_app:lukmi_app@localhost:5432/lukmi?sslmode=disable")
+	}
+
 	redisURL := getEnv("REDIS_URL", "redis://localhost:6379")
 	brokersStr := getEnv("REDPANDA_BROKERS", getEnv("KAFKA_BROKERS", "localhost:9092"))
 	kafkaTopic := getEnv("KAFKA_TOPIC", "messaging.events")
@@ -149,6 +153,10 @@ func Load() (*Config, error) {
 
 	// Strict Production Validation Rules
 	if cfg.IsProduction() {
+		if appDBURL == "" {
+			return nil, errors.New("production configuration error: APP_DATABASE_URL must be explicitly configured in production")
+		}
+
 		if cfg.JWTSecret == "" || len(cfg.JWTSecret) < 32 || strings.Contains(cfg.JWTSecret, "change-in-production") {
 			return nil, errors.New("production configuration error: JWT_SECRET must be explicitly configured with at least 32 characters in production")
 		}
@@ -158,11 +166,17 @@ func Load() (*Config, error) {
 		}
 
 		if cfg.DatabaseURL == "" || strings.Contains(cfg.DatabaseURL, "localhost:5432") {
-			return nil, errors.New("production configuration error: APP_DATABASE_URL / DATABASE_URL must be set to a valid production database endpoint")
+			return nil, errors.New("production configuration error: APP_DATABASE_URL must be set to a valid production database endpoint")
 		}
 
 		if len(cfg.AllowedOrigins) == 0 {
 			return nil, errors.New("production configuration error: ALLOWED_ORIGINS must be explicitly configured in production")
+		}
+
+		for _, origin := range cfg.AllowedOrigins {
+			if origin == "*" {
+				return nil, errors.New("production configuration error: ALLOWED_ORIGINS cannot contain wildcard '*' in production")
+			}
 		}
 	}
 

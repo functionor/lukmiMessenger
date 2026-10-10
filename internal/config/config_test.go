@@ -19,22 +19,39 @@ func TestConfigLoadDevelopmentDefaults(t *testing.T) {
 	}
 }
 
-func TestConfigLoadProductionFailsWithoutSecrets(t *testing.T) {
+func TestConfigLoadProductionFailsWithoutAppDatabaseURL(t *testing.T) {
 	os.Clearenv()
 	_ = os.Setenv("ENV", "production")
+	_ = os.Setenv("JWT_SECRET", "super-secret-production-jwt-key-32bytes-minimum!!")
+	_ = os.Setenv("GATEWAY_SECRET", "super-secret-gateway-key-16bytes!!")
+	_ = os.Setenv("ALLOWED_ORIGINS", "https://app.lukmi.com")
 
 	_, err := Load()
 	if err == nil {
-		t.Fatal("expected production Load to fail without explicit JWT_SECRET and GATEWAY_SECRET")
+		t.Fatal("expected production Load to fail without explicit APP_DATABASE_URL")
+	}
+}
+
+func TestConfigLoadProductionRejectsWildcardOrigin(t *testing.T) {
+	os.Clearenv()
+	_ = os.Setenv("ENV", "production")
+	_ = os.Setenv("APP_DATABASE_URL", "postgres://lukmi_app:pass@db.prod.internal:5432/lukmi_prod?sslmode=verify-full")
+	_ = os.Setenv("JWT_SECRET", "super-secret-production-jwt-key-32bytes-minimum!!")
+	_ = os.Setenv("GATEWAY_SECRET", "super-secret-gateway-key-16bytes!!")
+	_ = os.Setenv("ALLOWED_ORIGINS", "*") // Wildcard rejected in production
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected production Load to fail when ALLOWED_ORIGINS contains wildcard *")
 	}
 }
 
 func TestConfigLoadProductionValid(t *testing.T) {
 	os.Clearenv()
 	_ = os.Setenv("ENV", "production")
+	_ = os.Setenv("APP_DATABASE_URL", "postgres://lukmi_app:pass@db.prod.internal:5432/lukmi_prod?sslmode=verify-full")
 	_ = os.Setenv("JWT_SECRET", "super-secret-production-jwt-key-32bytes-minimum!!")
 	_ = os.Setenv("GATEWAY_SECRET", "super-secret-gateway-key-16bytes!!")
-	_ = os.Setenv("DATABASE_URL", "postgres://prod_user:secure_pass@db.prod.internal:5432/lukmi_prod?sslmode=verify-full")
 	_ = os.Setenv("ALLOWED_ORIGINS", "https://app.lukmi.com")
 
 	cfg, err := Load()
@@ -51,7 +68,7 @@ func TestConfigLoadInvalidPoolSizes(t *testing.T) {
 	os.Clearenv()
 	_ = os.Setenv("ENV", "development")
 	_ = os.Setenv("DB_MAX_OPEN_CONNS", "10")
-	_ = os.Setenv("DB_MAX_IDLE_CONNS", "20") // Max idle > Max open -> invalid
+	_ = os.Setenv("DB_MAX_IDLE_CONNS", "20")
 
 	_, err := Load()
 	if err == nil {

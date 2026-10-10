@@ -18,24 +18,47 @@ func TestHubOriginValidation(t *testing.T) {
 	hub := NewHub(cfg, memCache, nil)
 	defer hub.Close()
 
-	// Allowed origin
+	// 1. Allowed origin matching scheme, host, port
 	reqAllowed := httptest.NewRequest(http.MethodGet, "/api/v1/ws", nil)
 	reqAllowed.Header.Set("Origin", "https://app.lukmi.com")
 	if !hub.checkOrigin(reqAllowed) {
 		t.Fatal("expected origin https://app.lukmi.com to be allowed")
 	}
 
-	// Rejected origin
+	// 2. Rejected origin (different host)
 	reqRejected := httptest.NewRequest(http.MethodGet, "/api/v1/ws", nil)
 	reqRejected.Header.Set("Origin", "https://malicious-site.com")
 	if hub.checkOrigin(reqRejected) {
 		t.Fatal("expected origin https://malicious-site.com to be rejected")
 	}
 
-	// Native client without Origin header -> allowed
+	// 3. Rejected scheme mismatch (http vs https)
+	reqSchemeMismatch := httptest.NewRequest(http.MethodGet, "/api/v1/ws", nil)
+	reqSchemeMismatch.Header.Set("Origin", "http://app.lukmi.com")
+	if hub.checkOrigin(reqSchemeMismatch) {
+		t.Fatal("expected http://app.lukmi.com to be rejected when https is expected")
+	}
+
+	// 4. Native client without Origin header -> allowed when pre-authenticated
 	reqNative := httptest.NewRequest(http.MethodGet, "/api/v1/ws", nil)
 	if !hub.checkOrigin(reqNative) {
 		t.Fatal("expected native request without Origin header to be permitted")
+	}
+}
+
+func TestHubProductionRejectsWildcardOrigin(t *testing.T) {
+	cfg := &config.Config{
+		Env:            "production",
+		AllowedOrigins: []string{"*"},
+	}
+	memCache := cache.NewMemoryCache()
+	hub := NewHub(cfg, memCache, nil)
+	defer hub.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/ws", nil)
+	req.Header.Set("Origin", "https://arbitrary-domain.com")
+	if hub.checkOrigin(req) {
+		t.Fatal("expected wildcard origin * to be rejected in production mode")
 	}
 }
 

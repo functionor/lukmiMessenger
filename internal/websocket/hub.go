@@ -83,8 +83,16 @@ func (h *Hub) checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		// Native mobile clients (Flutter Android/iOS) do not send Origin header.
-		// Permitted because connection is authenticated prior to upgrade in ServeHTTP.
+		// Permitted ONLY because request identity is authenticated prior to upgrade in ServeHTTP.
 		return true
+	}
+
+	originURL, err := url.Parse(origin)
+	if err != nil || originURL.Host == "" {
+		if h.logger != nil {
+			h.logger.Warn("websocket origin rejected: malformed origin url", "origin", origin)
+		}
+		return false
 	}
 
 	if len(h.allowedOrigins) == 0 {
@@ -97,21 +105,24 @@ func (h *Hub) checkOrigin(r *http.Request) bool {
 		return true // Permitted in development mode
 	}
 
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-
 	for _, allowed := range h.allowedOrigins {
 		if allowed == "*" {
+			if h.isProduction {
+				// Reject wildcards in production!
+				continue
+			}
 			return true
 		}
-		if allowedURL, err := url.Parse(allowed); err == nil && allowedURL.Host != "" {
-			if strings.EqualFold(u.Host, allowedURL.Host) {
+
+		allowedURL, err := url.Parse(allowed)
+		if err == nil && allowedURL.Host != "" {
+			// Strictly compare scheme, hostname, and effective port
+			if (allowedURL.Scheme == "" || strings.EqualFold(originURL.Scheme, allowedURL.Scheme)) &&
+				strings.EqualFold(originURL.Hostname(), allowedURL.Hostname()) &&
+				originURL.Port() == allowedURL.Port() {
 				return true
 			}
-		}
-		if strings.EqualFold(u.Host, allowed) || strings.EqualFold(origin, allowed) {
+		} else if strings.EqualFold(originURL.Host, allowed) || strings.EqualFold(origin, allowed) {
 			return true
 		}
 	}

@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -45,7 +46,7 @@ func Auth(cfg *config.Config, logger *slog.Logger) func(http.Handler) http.Handl
 			headerGatewaySecret := r.Header.Get("X-Gateway-Secret")
 
 			if headerUserID != "" {
-				if cfg.GatewaySecret != "" && headerGatewaySecret == cfg.GatewaySecret {
+				if cfg.GatewaySecret != "" && subtle.ConstantTimeCompare([]byte(headerGatewaySecret), []byte(cfg.GatewaySecret)) == 1 {
 					if validUserIDRegex.MatchString(headerUserID) {
 						userID = headerUserID
 					} else {
