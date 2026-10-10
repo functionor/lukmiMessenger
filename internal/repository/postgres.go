@@ -458,7 +458,7 @@ func (p *PostgresRepository) DeleteMessageWithOutbox(ctx context.Context, conver
 		SET deleted_at = NOW()
 		WHERE conversation_id = $1 AND message_id = $2 AND sender_id = $3 AND deleted_at IS NULL
 	`
-	res, err := tx.ExecContext(ctx, query, conversationID, messageID, userID)
+	res, err := p.db.ExecContext(ctx, query, conversationID, messageID, userID)
 	if err != nil {
 		return err
 	}
@@ -497,7 +497,7 @@ func (p *PostgresRepository) DeleteMessageWithOutbox(ctx context.Context, conver
 	return tx.Commit()
 }
 
-func (p *PostgresRepository) ClaimPendingOutboxEvents(ctx context.Context, processorID string, leaseDuration time.Duration, limit int) ([]*model.Event, error) {
+func (p *PostgresRepository) ClaimPendingOutboxEvents(ctx context.Context, processorID string, claimToken string, leaseDuration time.Duration, limit int) ([]*model.Event, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -507,18 +507,19 @@ func (p *PostgresRepository) ClaimPendingOutboxEvents(ctx context.Context, proce
 		UPDATE outbox_events
 		SET status = 'processing',
 		    processor_id = $1,
-		    locked_until = NOW() + $2::interval
+		    claim_token = $2,
+		    locked_until = NOW() + $3::interval
 		WHERE event_id IN (
 			SELECT event_id
 			FROM outbox_events
 			WHERE status = 'pending' OR (status = 'processing' AND (locked_until IS NULL OR locked_until < NOW()))
 			ORDER BY created_at ASC
-			LIMIT $3
+			LIMIT $4
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING payload
+		RETURNING event_id, payload
 	`
-	rows, err := p.db.QueryContext(ctx, query, processorID, leaseSeconds, limit)
+	rows, err := p.db.QueryContext(ctx, query, processorID, claimToken, leaseSeconds, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -526,13 +527,17 @@ func (p *PostgresRepository) ClaimPendingOutboxEvents(ctx context.Context, proce
 
 	var events []*model.Event
 	for rows.Next() {
+		var eventID string
 		var payloadBytes []byte
-		if err := rows.Scan(&payloadBytes); err != nil {
+		if err := rows.Scan(&eventID, &payloadBytes); err != nil {
 			return nil, err
 		}
 		var evt model.Event
 		if err := json.Unmarshal(payloadBytes, &evt); err == nil {
 			events = append(events, &evt)
+		} else {
+			// Quarantine malformed payload so it doesn't block outbox loop indefinitely
+			_, _ = p.db.ExecContext(ctx, `UPDATE outbox_events SET status = 'failed', last_error = $1 WHERE event_id = $2`, "malformed json payload", eventID)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -541,13 +546,13 @@ func (p *PostgresRepository) ClaimPendingOutboxEvents(ctx context.Context, proce
 	return events, nil
 }
 
-func (p *PostgresRepository) MarkOutboxEventPublished(ctx context.Context, eventID string, processorID string) error {
+func (p *PostgresRepository) MarkOutboxEventPublished(ctx context.Context, eventID string, claimToken string) error {
 	query := `
 		UPDATE outbox_events
 		SET status = 'published', published_at = NOW(), locked_until = NULL
-		WHERE event_id = $1 AND processor_id = $2
+		WHERE event_id = $1 AND claim_token = $2
 	`
-	res, err := p.db.ExecContext(ctx, query, eventID, processorID)
+	res, err := p.db.ExecContext(ctx, query, eventID, claimToken)
 	if err != nil {
 		return err
 	}
@@ -556,18 +561,21 @@ func (p *PostgresRepository) MarkOutboxEventPublished(ctx context.Context, event
 		return err
 	}
 	if rows == 0 {
-		return fmt.Errorf("outbox event %s not found or processor mismatch", eventID)
+		return ErrStaleClaim
 	}
 	return nil
 }
 
-func (p *PostgresRepository) RecordOutboxEventFailure(ctx context.Context, eventID string, processorID string, errMsg string) error {
+func (p *PostgresRepository) RecordOutboxEventFailure(ctx context.Context, eventID string, claimToken string, errMsg string) error {
 	query := `
 		UPDATE outbox_events
-		SET status = 'pending', retry_count = retry_count + 1, last_error = $3, locked_until = NULL
-		WHERE event_id = $1 AND processor_id = $2
+		SET status = CASE WHEN retry_count + 1 >= 10 THEN 'failed' ELSE 'pending' END,
+		    retry_count = retry_count + 1,
+		    last_error = $3,
+		    locked_until = NULL
+		WHERE event_id = $1 AND claim_token = $2
 	`
-	res, err := p.db.ExecContext(ctx, query, eventID, processorID, errMsg)
+	res, err := p.db.ExecContext(ctx, query, eventID, claimToken, errMsg)
 	if err != nil {
 		return err
 	}
@@ -576,9 +584,28 @@ func (p *PostgresRepository) RecordOutboxEventFailure(ctx context.Context, event
 		return err
 	}
 	if rows == 0 {
-		return fmt.Errorf("outbox event %s failure record failed", eventID)
+		return ErrStaleClaim
 	}
 	return nil
+}
+
+func (p *PostgresRepository) IsEventProcessed(ctx context.Context, eventID string) (bool, error) {
+	query := `SELECT COUNT(1) FROM processed_events WHERE event_id = $1`
+	var count int
+	if err := p.db.QueryRowContext(ctx, query, eventID).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (p *PostgresRepository) MarkEventProcessed(ctx context.Context, eventID string, eventType string) error {
+	query := `
+		INSERT INTO processed_events (event_id, event_type, processed_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (event_id) DO NOTHING
+	`
+	_, err := p.db.ExecContext(ctx, query, eventID, eventType)
+	return err
 }
 
 func scanMessage(row *sql.Row) (*model.Message, error) {

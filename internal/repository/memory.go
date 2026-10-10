@@ -9,25 +9,29 @@ import (
 )
 
 type MemoryRepository struct {
-	mu            sync.RWMutex
-	conversations map[string]*model.Conversation
-	members       map[string]map[string]*model.ConversationMember
-	messages      map[string][]*model.Message
-	clientIDs     map[string]*model.Message
-	reads         map[string]*model.MessageRead
-	outboxEvents  map[string]*model.Event
-	outboxStatus  map[string]string
+	mu              sync.RWMutex
+	conversations   map[string]*model.Conversation
+	members         map[string]map[string]*model.ConversationMember
+	messages        map[string][]*model.Message
+	clientIDs       map[string]*model.Message
+	reads           map[string]*model.MessageRead
+	outboxEvents    map[string]*model.Event
+	outboxStatus    map[string]string
+	outboxTokens    map[string]string
+	processedEvents map[string]bool
 }
 
 func NewMemoryRepository() *MemoryRepository {
 	return &MemoryRepository{
-		conversations: map[string]*model.Conversation{},
-		members:       map[string]map[string]*model.ConversationMember{},
-		messages:      map[string][]*model.Message{},
-		clientIDs:     map[string]*model.Message{},
-		reads:         map[string]*model.MessageRead{},
-		outboxEvents:  map[string]*model.Event{},
-		outboxStatus:  map[string]string{},
+		conversations:   map[string]*model.Conversation{},
+		members:         map[string]map[string]*model.ConversationMember{},
+		messages:        map[string][]*model.Message{},
+		clientIDs:       map[string]*model.Message{},
+		reads:           map[string]*model.MessageRead{},
+		outboxEvents:    map[string]*model.Event{},
+		outboxStatus:    map[string]string{},
+		outboxTokens:    map[string]string{},
+		processedEvents: map[string]bool{},
 	}
 }
 
@@ -321,7 +325,7 @@ func (r *MemoryRepository) DeleteMessageWithOutbox(_ context.Context, conversati
 	return ErrNotFound
 }
 
-func (r *MemoryRepository) ClaimPendingOutboxEvents(_ context.Context, _ string, _ time.Duration, limit int) ([]*model.Event, error) {
+func (r *MemoryRepository) ClaimPendingOutboxEvents(_ context.Context, processorID string, claimToken string, _ time.Duration, limit int) ([]*model.Event, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -330,6 +334,7 @@ func (r *MemoryRepository) ClaimPendingOutboxEvents(_ context.Context, _ string,
 		if r.outboxStatus[id] == "pending" {
 			pending = append(pending, evt)
 			r.outboxStatus[id] = "processing"
+			r.outboxTokens[id] = claimToken
 			if len(pending) == limit {
 				break
 			}
@@ -338,16 +343,39 @@ func (r *MemoryRepository) ClaimPendingOutboxEvents(_ context.Context, _ string,
 	return pending, nil
 }
 
-func (r *MemoryRepository) MarkOutboxEventPublished(_ context.Context, eventID string, _ string) error {
+func (r *MemoryRepository) MarkOutboxEventPublished(_ context.Context, eventID string, claimToken string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.outboxTokens[eventID] != claimToken {
+		return ErrStaleClaim
+	}
 	r.outboxStatus[eventID] = "published"
 	return nil
 }
 
-func (r *MemoryRepository) RecordOutboxEventFailure(_ context.Context, eventID string, _ string, _ string) error {
+func (r *MemoryRepository) RecordOutboxEventFailure(_ context.Context, eventID string, claimToken string, _ string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.outboxTokens[eventID] != claimToken {
+		return ErrStaleClaim
+	}
 	r.outboxStatus[eventID] = "pending"
+	return nil
+}
+
+func (r *MemoryRepository) IsEventProcessed(_ context.Context, eventID string) (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.processedEvents[eventID], nil
+}
+
+func (r *MemoryRepository) MarkEventProcessed(_ context.Context, eventID string, _ string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.processedEvents[eventID] = true
 	return nil
 }

@@ -8,6 +8,19 @@ import (
 	"github.com/lukmi/messaging-service/internal/model"
 )
 
+type mockDeduplicator struct {
+	processed map[string]bool
+}
+
+func (m *mockDeduplicator) IsEventProcessed(_ context.Context, eventID string) (bool, error) {
+	return m.processed[eventID], nil
+}
+
+func (m *mockDeduplicator) MarkEventProcessed(_ context.Context, eventID string, _ string) error {
+	m.processed[eventID] = true
+	return nil
+}
+
 func TestMemoryPublisherRecordsEvents(t *testing.T) {
 	pub := NewMemoryPublisher(nil)
 	ctx := context.Background()
@@ -34,18 +47,19 @@ func TestMemoryPublisherRecordsEvents(t *testing.T) {
 	}
 }
 
-func TestConsumerDuplicateHandling(t *testing.T) {
-	consumer := &Consumer{
-		processedEvents: make(map[string]time.Time),
+func TestDurableDeduplicator(t *testing.T) {
+	dedup := &mockDeduplicator{processed: make(map[string]bool)}
+	ctx := context.Background()
+
+	processed, err := dedup.IsEventProcessed(ctx, "evt-123")
+	if err != nil || processed {
+		t.Fatal("event should not be marked processed initially")
 	}
 
-	if consumer.isDuplicate("evt-123") {
-		t.Fatal("new event should not be marked duplicate")
-	}
+	_ = dedup.MarkEventProcessed(ctx, "evt-123", "MESSAGE_SENT")
 
-	consumer.markProcessed("evt-123")
-
-	if !consumer.isDuplicate("evt-123") {
-		t.Fatal("processed event should be marked duplicate")
+	processed, err = dedup.IsEventProcessed(ctx, "evt-123")
+	if err != nil || !processed {
+		t.Fatal("event should be marked processed after MarkEventProcessed")
 	}
 }

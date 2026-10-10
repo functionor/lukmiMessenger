@@ -2,6 +2,9 @@ package kafka
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -10,9 +13,9 @@ import (
 )
 
 type OutboxRepository interface {
-	ClaimPendingOutboxEvents(ctx context.Context, processorID string, leaseDuration time.Duration, limit int) ([]*model.Event, error)
-	MarkOutboxEventPublished(ctx context.Context, eventID string, processorID string) error
-	RecordOutboxEventFailure(ctx context.Context, eventID string, processorID string, errMsg string) error
+	ClaimPendingOutboxEvents(ctx context.Context, processorID string, claimToken string, leaseDuration time.Duration, limit int) ([]*model.Event, error)
+	MarkOutboxEventPublished(ctx context.Context, eventID string, claimToken string) error
+	RecordOutboxEventFailure(ctx context.Context, eventID string, claimToken string, errMsg string) error
 }
 
 type OutboxProcessor struct {
@@ -64,7 +67,8 @@ func (op *OutboxProcessor) Start(ctx context.Context) {
 }
 
 func (op *OutboxProcessor) processBatch(ctx context.Context) {
-	events, err := op.repo.ClaimPendingOutboxEvents(ctx, op.processorID, 30*time.Second, 50)
+	claimToken := generateClaimToken(op.processorID)
+	events, err := op.repo.ClaimPendingOutboxEvents(ctx, op.processorID, claimToken, 30*time.Second, 50)
 	if err != nil {
 		if op.logger != nil {
 			op.logger.Error("outbox processor failed to claim pending events", "processor_id", op.processorID, "error", err)
@@ -79,15 +83,15 @@ func (op *OutboxProcessor) processBatch(ctx context.Context) {
 
 		pubErr := op.publisher.Publish(ctx, *event)
 		if pubErr == nil {
-			if markErr := op.repo.MarkOutboxEventPublished(ctx, event.ID, op.processorID); markErr != nil {
+			if markErr := op.repo.MarkOutboxEventPublished(ctx, event.ID, claimToken); markErr != nil {
 				if op.logger != nil {
-					op.logger.Error("outbox processor failed to mark event published", "event_id", event.ID, "error", markErr)
+					op.logger.Error("outbox processor failed to mark event published", "event_id", event.ID, "claim_token", claimToken, "error", markErr)
 				}
 			} else if op.logger != nil {
 				op.logger.Debug("outbox event published successfully", "event_id", event.ID, "event_type", event.Type)
 			}
 		} else {
-			if recErr := op.repo.RecordOutboxEventFailure(ctx, event.ID, op.processorID, pubErr.Error()); recErr != nil {
+			if recErr := op.repo.RecordOutboxEventFailure(ctx, event.ID, claimToken, pubErr.Error()); recErr != nil {
 				if op.logger != nil {
 					op.logger.Error("outbox processor failed to record event failure", "event_id", event.ID, "error", recErr)
 				}
@@ -103,14 +107,15 @@ func (op *OutboxProcessor) flushPending(ctx context.Context) {
 	flushCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	events, err := op.repo.ClaimPendingOutboxEvents(flushCtx, op.processorID, 10*time.Second, 100)
+	claimToken := generateClaimToken(op.processorID)
+	events, err := op.repo.ClaimPendingOutboxEvents(flushCtx, op.processorID, claimToken, 10*time.Second, 100)
 	if err != nil || len(events) == 0 {
 		return
 	}
 
 	for _, event := range events {
 		if op.publisher.Publish(flushCtx, *event) == nil {
-			_ = op.repo.MarkOutboxEventPublished(flushCtx, event.ID, op.processorID)
+			_ = op.repo.MarkOutboxEventPublished(flushCtx, event.ID, claimToken)
 		}
 	}
 }
@@ -120,4 +125,10 @@ func (op *OutboxProcessor) Stop() {
 		op.cancel()
 	}
 	op.wg.Wait()
+}
+
+func generateClaimToken(processorID string) string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%s-%d-%s", processorID, time.Now().UnixNano(), hex.EncodeToString(b))
 }

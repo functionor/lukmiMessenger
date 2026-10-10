@@ -1,0 +1,41 @@
+name: Lukmi Messaging Service CI
+
+on:
+  push:
+    branches: [ v1, main ]
+  pull_request:
+    branches: [ v1, main ]
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Go Format Check
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "The following files are not formatted:"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Run Unit & Integration Tests (with Race Detector)
+        run: go test -race -count=1 ./...
+
+      - name: Build Binary
+        run: go build -o messaging-service ./cmd/server
+
+      - name: Build Docker Image
+        run: docker build -t lukmi-messenger:v1 .

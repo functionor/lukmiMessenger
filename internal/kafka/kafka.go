@@ -17,6 +17,11 @@ type EventPublisher interface {
 	Close() error
 }
 
+type Deduplicator interface {
+	IsEventProcessed(ctx context.Context, eventID string) (bool, error)
+	MarkEventProcessed(ctx context.Context, eventID string, eventType string) error
+}
+
 type Producer struct {
 	writer *kafka.Writer
 	logger *slog.Logger
@@ -31,7 +36,7 @@ func NewProducer(brokers []string, topic string, logger *slog.Logger) (*Producer
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
 		Topic:        topic,
-		Balancer:     &kafka.Hash{}, // Hash by Key (ConversationID) to preserve message ordering per conversation
+		Balancer:     &kafka.Hash{},
 		MaxAttempts:  5,
 		WriteTimeout: 10 * time.Second,
 		RequiredAcks: kafka.RequireOne,
@@ -81,13 +86,12 @@ func (p *Producer) Close() error {
 }
 
 type Consumer struct {
-	reader          *kafka.Reader
-	logger          *slog.Logger
-	processedEvents map[string]time.Time
-	mu              sync.RWMutex
+	reader *kafka.Reader
+	dedup  Deduplicator
+	logger *slog.Logger
 }
 
-func NewConsumer(brokers []string, topic, groupID string, logger *slog.Logger) *Consumer {
+func NewConsumer(brokers []string, topic, groupID string, dedup Deduplicator, logger *slog.Logger) *Consumer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
 		Topic:          topic,
@@ -99,9 +103,9 @@ func NewConsumer(brokers []string, topic, groupID string, logger *slog.Logger) *
 	})
 
 	return &Consumer{
-		reader:          reader,
-		logger:          logger,
-		processedEvents: make(map[string]time.Time),
+		reader: reader,
+		dedup:  dedup,
+		logger: logger,
 	}
 }
 
@@ -130,52 +134,27 @@ func (c *Consumer) Start(ctx context.Context, handler func(ctx context.Context, 
 					continue
 				}
 
-				// Idempotency check for duplicate event delivery
-				if c.isDuplicate(event.ID) {
-					c.logger.Info("ignoring duplicate kafka event", "event_id", event.ID)
-					_ = c.reader.CommitMessages(ctx, msg)
-					continue
+				// Durable idempotency check
+				if c.dedup != nil {
+					processed, checkErr := c.dedup.IsEventProcessed(ctx, event.ID)
+					if checkErr == nil && processed {
+						c.logger.Info("ignoring duplicate kafka event via durable deduplicator", "event_id", event.ID)
+						_ = c.reader.CommitMessages(ctx, msg)
+						continue
+					}
 				}
 
 				if err := handler(ctx, event); err != nil {
-					c.logger.Error("error processing kafka event", "event_id", event.ID, "error", err)
-					// Handle retries or error logging without committing if needed
+					c.logger.Error("error processing kafka event, offset NOT committed for retry", "event_id", event.ID, "error", err)
 				} else {
-					c.markProcessed(event.ID)
+					if c.dedup != nil {
+						_ = c.dedup.MarkEventProcessed(ctx, event.ID, string(event.Type))
+					}
 					_ = c.reader.CommitMessages(ctx, msg)
 				}
 			}
 		}
 	}()
-}
-
-func (c *Consumer) isDuplicate(eventID string) bool {
-	if eventID == "" {
-		return false
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, exists := c.processedEvents[eventID]
-	return exists
-}
-
-func (c *Consumer) markProcessed(eventID string) {
-	if eventID == "" {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.processedEvents[eventID] = time.Now()
-
-	// Clean up old tracked events if map gets large
-	if len(c.processedEvents) > 10000 {
-		cutoff := time.Now().Add(-24 * time.Hour)
-		for id, t := range c.processedEvents {
-			if t.Before(cutoff) {
-				delete(c.processedEvents, id)
-			}
-		}
-	}
 }
 
 func (c *Consumer) Close() error {

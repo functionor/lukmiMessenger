@@ -22,7 +22,7 @@ func newMockOutboxRepo() *mockOutboxRepo {
 	}
 }
 
-func (m *mockOutboxRepo) ClaimPendingOutboxEvents(_ context.Context, _ string, _ time.Duration, limit int) ([]*model.Event, error) {
+func (m *mockOutboxRepo) ClaimPendingOutboxEvents(_ context.Context, _ string, _ string, _ time.Duration, limit int) ([]*model.Event, error) {
 	var res []*model.Event
 	for id, evt := range m.events {
 		if !m.published[id] {
