@@ -1,12 +1,12 @@
-# Lukmi Messaging Service Backend
+# Lukmi Messaging Service Backend (v1 Hardened)
 
-Production-oriented backend microservice for the **Lukmi Messaging Service** written in **Go**.
+Production-hardened Go backend microservice for the **Lukmi Messaging Service**.
 
-The Messaging Service is an internal microservice located behind the Public API Gateway. It owns conversations, members, messages, message delivery states, read receipts, WebSocket real-time communication, and message synchronization.
+The Messaging Service is an internal service located behind the Public API Gateway. It owns conversations, members, messages, message delivery states, read receipts, WebSocket real-time delivery across instances, and asynchronous event publishing.
 
 ---
 
-## 1. Architecture & Boundaries
+## 1. Architecture & Service Boundaries
 
 ```text
 Flutter App
@@ -15,88 +15,94 @@ Flutter App
      ▼
 Public API Gateway
      │
+     ├── X-Gateway-Secret / Bearer JWT
      ▼
 Messaging Service
      │
-     ├── PostgreSQL (Durable Store)
-     ├── Redis (Transient State & WS Pub/Sub)
-     └── Kafka/Redpanda (Async Events)
+     ├── PostgreSQL (APP_DATABASE_URL - lukmi_app runtime role)
+     ├── Redis (Transient Presence & Cross-Node WS Events)
+     └── Kafka/Redpanda (Messaging Domain Events)
 ```
 
 ### Critical Boundaries
-- **Content / User / Story isolation**: When users share a post (`POST_SHARE`), profile (`PROFILE_SHARE`), or story (`STORY_SHARE`), the Messaging Service stores only the `reference_id` (resource UUID). It **never queries** Content Service, User Service, or Story Service to fetch full resource details.
-- **Media**: Messages with media (`IMAGE`, `VIDEO`, `AUDIO`, `FILE`) store `media_id`. Media binaries remain owned by Media Service / Cloudflare R2.
-- **E2EE Support**: The service accepts client-encrypted `ciphertext` without needing plaintext message content or managing private keys.
-- **Notifications**: FCM/APNs push notification delivery is owned by the Notification Service. Messaging Service publishes asynchronous Kafka events (`MESSAGE_SENT`, `MESSAGE_READ`, `MESSAGE_DELETED`) consumed by Notification Service.
+- **Resource Ownership**: Shared content (`POST_SHARE`, `PROFILE_SHARE`, `STORY_SHARE`) stores only the resource `reference_id`. The Messaging Service never queries Content, User, or Story services. Clients fetch full resources directly via the API Gateway.
+- **Media**: Messages with media reference `media_id`. Binary media storage is owned by Media Service / Cloudflare R2.
+- **E2EE**: Accepts client-encrypted `ciphertext` without performing server-side decryption or key management.
+- **Push Notifications**: Push notifications (FCM/APNs) are owned by the Notification Service, which consumes asynchronous events (`MESSAGE_SENT`, `MESSAGE_READ`, `MESSAGE_DELETED`) published to Kafka/Redpanda.
 
 ---
 
-## 2. Supported Message Types
+## 2. Security & Authentication Contract
 
-- `TEXT`
-- `IMAGE`
-- `VIDEO`
-- `AUDIO`
-- `FILE`
-- `POST_SHARE` (requires `reference_id = post_uuid`)
-- `PROFILE_SHARE` (requires `reference_id = user_uuid`)
-- `STORY_SHARE` (requires `reference_id = story_uuid`)
+### API Gateway Trust Contract
+In production, requests forwarded by the API Gateway must supply:
+- `X-User-ID`: The authenticated user ID.
+- `X-Gateway-Secret`: Header matching `GATEWAY_SECRET` configured on the service.
 
----
+Direct client connections supplying a JWT bearer token are authenticated using HMAC (`HS256` pinned) with required claim checks (`sub` / `user_id`, `exp`, `iss` matching `JWT_ISSUER`, `aud` matching `JWT_AUDIENCE`).
 
-## 3. Database Schema & Migration
-
-The service connects to PostgreSQL and uses the central database schema:
-
-- `conversations`
-- `conversation_members`
-- `messages` (extended with `reference_id`, `ciphertext`, `client_message_id`)
-- `message_reads`
-
-Migration scripts are located in `migrations/000001_init_messaging_schema.up.sql`.
+Unauthenticated requests, forged headers, or invalid tokens return `401 Unauthorized`.
 
 ---
 
-## 4. API Endpoints
+## 3. Database Schema Ownership & Outbox Pattern
 
-### Health & Readiness
-- `GET /healthz` - Basic liveness probe
-- `GET /readyz` - Readiness probe (checks PostgreSQL & Redis connectivity)
+The central database schema is owned by:
+`https://github.com/functionor/lukmi_database`
 
-### Real-Time WebSocket
-- `GET /api/v1/ws` - Authenticated WebSocket endpoint supporting multi-device real-time event delivery (`message.new`, `message.read`, `message.deleted`)
+The service connects using `APP_DATABASE_URL` with runtime credentials (`lukmi_app`). **Runtime DDL auto-migrations are disabled.**
 
-### Conversations
-- `POST /api/v1/conversations` - Create a conversation (`conversation_type`, `member_ids`)
-- `GET /api/v1/conversations` - List active conversations for the authenticated user
-- `GET /api/v1/conversations/{conversation_id}` - Get conversation details
-- `GET /api/v1/conversations/{conversation_id}/members` - Get active conversation members
-- `POST /api/v1/conversations/{conversation_id}/leave` - Leave conversation
+### Required Migrations for `lukmi-database`
+- `migrations/000001_init_messaging_schema.up.sql`: Conversations, members, messages, and read receipt tables.
+- `migrations/000002_add_outbox_events.up.sql`: Transactional outbox table (`outbox_events`) for reliable event delivery.
 
-### Messages
-- `POST /api/v1/conversations/{conversation_id}/messages` - Send message (text, media, post/profile/story share, or E2EE ciphertext with client idempotency key)
-- `GET /api/v1/conversations/{conversation_id}/messages` - Sync messages with cursor/limit pagination
-- `POST /api/v1/conversations/{conversation_id}/messages/{message_id}/read` - Mark message as read
-- `DELETE /api/v1/conversations/{conversation_id}/messages/{message_id}` - Soft-delete message (sender-authorized)
+### Transactional Outbox Worker
+When messages, read receipts, or soft-deletions are written, an `outbox_events` record is created inside the same PostgreSQL database transaction. An asynchronous background `OutboxProcessor` atomically claims pending events with a lease lock (`FOR UPDATE SKIP LOCKED`) and publishes them to Kafka/Redpanda.
 
 ---
 
-## 5. Development & Testing
+## 4. Keyset Pagination
 
-### Run Tests
+- **Messages Pagination**: Uses compound keyset cursor `(created_at, message_id)`.
+- **Conversations Pagination**: Uses compound keyset cursor `(updated_at, conversation_id)`.
+- API endpoints return `next_cursor` strings. Invalid or malformed cursor strings return `400 Bad Request`.
+
+---
+
+## 5. Configuration & Environment Variables
+
+| Variable | Description | Production Requirement |
+| :--- | :--- | :--- |
+| `ENV` | Environment mode (`development`, `test`, `production`) | Required |
+| `PORT` | Listening HTTP port | Default: `8080` |
+| `APP_DATABASE_URL` | PostgreSQL runtime database URL (`lukmi_app` user) | Required in production |
+| `REDIS_URL` | Redis URL for presence and cross-node WS fan-out | Required in production |
+| `ALLOW_DEGRADED_REDIS` | Set `true` to allow single-instance running if Redis is down | Default: `false` |
+| `REDPANDA_BROKERS` | Kafka/Redpanda broker addresses | Required in production |
+| `KAFKA_TOPIC` | Event topic name | Default: `messaging.events` |
+| `JWT_SECRET` | Secret key for JWT verification | Required (min 32 chars) |
+| `JWT_ISSUER` | Expected JWT issuer claim | Default: `lukmi-auth` |
+| `JWT_AUDIENCE` | Expected JWT audience claim | Default: `lukmi-messaging` |
+| `GATEWAY_SECRET` | Secret key for API Gateway assertion | Required (min 16 chars) |
+| `ALLOWED_ORIGINS` | Comma-separated allowed WebSocket origins | Required in production |
+
+---
+
+## 6. Build & Test Commands
+
 ```sh
-go test ./...
+# Run unit and integration tests
+go test -count=1 ./...
+
+# Run tests with race detector
+go test -race ./...
+
+# Static analysis
+go vet ./...
+
+# Format check
+gofmt -s -w .
+
+# Build server binary
+go build -o bin/messaging-service ./cmd/server
 ```
-
-### Run Service
-```sh
-go run ./cmd/server
-```
-
----
-
-## 6. Infrastructure Integration
-
-- **PostgreSQL**: Durable storage for conversations, members, messages, and read receipts.
-- **Redis**: User presence (`user:{id}:presence`), device connection tracking (`user:{id}:connections`), and Redis Pub/Sub (`messaging:ws_events`) for horizontal scaling across multiple instances.
-- **Kafka / Redpanda**: Asynchronous publishing of `MESSAGE_SENT`, `MESSAGE_READ`, `MESSAGE_DELETED` events to the `messaging.events` topic with retries and duplicate event consumer handling.

@@ -283,10 +283,8 @@ func (p *PostgresRepository) CreateMessageWithOutbox(ctx context.Context, m *mod
 		return nil, err
 	}
 
-	// Update conversation updated_at timestamp
 	_, _ = tx.ExecContext(ctx, `UPDATE conversations SET updated_at = $1 WHERE conversation_id = $2`, m.CreatedAt, m.ConversationID)
 
-	// Transactional Outbox Event insertion
 	if event != nil {
 		payloadBytes, err := json.Marshal(event)
 		if err != nil {
@@ -409,7 +407,6 @@ func (p *PostgresRepository) MarkReadWithOutbox(ctx context.Context, read *model
 	}
 	defer tx.Rollback()
 
-	// Enforce that message_id exists and belongs to conversation_id
 	var exists int
 	checkQuery := `SELECT 1 FROM messages WHERE message_id = $1 AND conversation_id = $2`
 	if err := tx.QueryRowContext(ctx, checkQuery, read.MessageID, read.ConversationID).Scan(&exists); err != nil {
@@ -500,19 +497,28 @@ func (p *PostgresRepository) DeleteMessageWithOutbox(ctx context.Context, conver
 	return tx.Commit()
 }
 
-func (p *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*model.Event, error) {
+func (p *PostgresRepository) ClaimPendingOutboxEvents(ctx context.Context, processorID string, leaseDuration time.Duration, limit int) ([]*model.Event, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	leaseSeconds := fmt.Sprintf("%d seconds", int(leaseDuration.Seconds()))
+
 	query := `
-		SELECT event_id, payload
-		FROM outbox_events
-		WHERE status = 'pending'
-		ORDER BY created_at ASC
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED
+		UPDATE outbox_events
+		SET status = 'processing',
+		    processor_id = $1,
+		    locked_until = NOW() + $2::interval
+		WHERE event_id IN (
+			SELECT event_id
+			FROM outbox_events
+			WHERE status = 'pending' OR (status = 'processing' AND (locked_until IS NULL OR locked_until < NOW()))
+			ORDER BY created_at ASC
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING payload
 	`
-	rows, err := p.db.QueryContext(ctx, query, limit)
+	rows, err := p.db.QueryContext(ctx, query, processorID, leaseSeconds, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -520,9 +526,8 @@ func (p *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit i
 
 	var events []*model.Event
 	for rows.Next() {
-		var eventID string
 		var payloadBytes []byte
-		if err := rows.Scan(&eventID, &payloadBytes); err != nil {
+		if err := rows.Scan(&payloadBytes); err != nil {
 			return nil, err
 		}
 		var evt model.Event
@@ -536,24 +541,44 @@ func (p *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit i
 	return events, nil
 }
 
-func (p *PostgresRepository) MarkOutboxEventPublished(ctx context.Context, eventID string) error {
+func (p *PostgresRepository) MarkOutboxEventPublished(ctx context.Context, eventID string, processorID string) error {
 	query := `
 		UPDATE outbox_events
-		SET status = 'published', published_at = NOW()
-		WHERE event_id = $1
+		SET status = 'published', published_at = NOW(), locked_until = NULL
+		WHERE event_id = $1 AND processor_id = $2
 	`
-	_, err := p.db.ExecContext(ctx, query, eventID)
-	return err
+	res, err := p.db.ExecContext(ctx, query, eventID, processorID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("outbox event %s not found or processor mismatch", eventID)
+	}
+	return nil
 }
 
-func (p *PostgresRepository) RecordOutboxEventFailure(ctx context.Context, eventID string, errMsg string) error {
+func (p *PostgresRepository) RecordOutboxEventFailure(ctx context.Context, eventID string, processorID string, errMsg string) error {
 	query := `
 		UPDATE outbox_events
-		SET retry_count = retry_count + 1, last_error = $2
-		WHERE event_id = $1
+		SET status = 'pending', retry_count = retry_count + 1, last_error = $3, locked_until = NULL
+		WHERE event_id = $1 AND processor_id = $2
 	`
-	_, err := p.db.ExecContext(ctx, query, eventID, errMsg)
-	return err
+	res, err := p.db.ExecContext(ctx, query, eventID, processorID, errMsg)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("outbox event %s failure record failed", eventID)
+	}
+	return nil
 }
 
 func scanMessage(row *sql.Row) (*model.Message, error) {

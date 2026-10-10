@@ -35,6 +35,7 @@ func TestConfigLoadProductionValid(t *testing.T) {
 	_ = os.Setenv("JWT_SECRET", "super-secret-production-jwt-key-32bytes-minimum!!")
 	_ = os.Setenv("GATEWAY_SECRET", "super-secret-gateway-key-16bytes!!")
 	_ = os.Setenv("DATABASE_URL", "postgres://prod_user:secure_pass@db.prod.internal:5432/lukmi_prod?sslmode=verify-full")
+	_ = os.Setenv("ALLOWED_ORIGINS", "https://app.lukmi.com")
 
 	cfg, err := Load()
 	if err != nil {
@@ -61,7 +62,7 @@ func TestConfigLoadInvalidPoolSizes(t *testing.T) {
 func TestConfigLoadInvalidPort(t *testing.T) {
 	os.Clearenv()
 	_ = os.Setenv("ENV", "development")
-	_ = os.Setenv("PORT", "999999") // Invalid port
+	_ = os.Setenv("PORT", "999999")
 
 	_, err := Load()
 	if err == nil {

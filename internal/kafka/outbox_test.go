@@ -22,7 +22,7 @@ func newMockOutboxRepo() *mockOutboxRepo {
 	}
 }
 
-func (m *mockOutboxRepo) GetPendingOutboxEvents(_ context.Context, limit int) ([]*model.Event, error) {
+func (m *mockOutboxRepo) ClaimPendingOutboxEvents(_ context.Context, _ string, _ time.Duration, limit int) ([]*model.Event, error) {
 	var res []*model.Event
 	for id, evt := range m.events {
 		if !m.published[id] {
@@ -35,12 +35,12 @@ func (m *mockOutboxRepo) GetPendingOutboxEvents(_ context.Context, limit int) ([
 	return res, nil
 }
 
-func (m *mockOutboxRepo) MarkOutboxEventPublished(_ context.Context, eventID string) error {
+func (m *mockOutboxRepo) MarkOutboxEventPublished(_ context.Context, eventID string, _ string) error {
 	m.published[eventID] = true
 	return nil
 }
 
-func (m *mockOutboxRepo) RecordOutboxEventFailure(_ context.Context, eventID string, _ string) error {
+func (m *mockOutboxRepo) RecordOutboxEventFailure(_ context.Context, eventID string, _ string, _ string) error {
 	m.failures[eventID]++
 	return nil
 }
@@ -48,7 +48,7 @@ func (m *mockOutboxRepo) RecordOutboxEventFailure(_ context.Context, eventID str
 func TestOutboxProcessorPublishesPendingEvents(t *testing.T) {
 	repo := newMockOutboxRepo()
 	publisher := NewMemoryPublisher(nil)
-	processor := NewOutboxProcessor(repo, publisher, nil, 10*time.Millisecond)
+	processor := NewOutboxProcessor("proc-1", repo, publisher, nil, 10*time.Millisecond)
 
 	evt := &model.Event{
 		ID:             "outbox-evt-1",

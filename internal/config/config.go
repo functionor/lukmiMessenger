@@ -11,23 +11,26 @@ import (
 )
 
 type Config struct {
-	Env               string
-	Port              string
-	DatabaseURL       string
-	RedisURL          string
-	RedpandaBrokers   []string
-	KafkaTopic        string
-	KafkaGroupID      string
-	JWTSecret         string
-	GatewaySecret     string
-	AllowedOrigins    []string
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
-	ShutdownTimeout   time.Duration
-	DBMaxOpenConns    int
-	DBMaxIdleConns    int
-	DBConnMaxLifetime time.Duration
+	Env                string
+	Port               string
+	DatabaseURL        string
+	RedisURL           string
+	RedpandaBrokers    []string
+	KafkaTopic         string
+	KafkaGroupID       string
+	JWTSecret          string
+	JWTIssuer          string
+	JWTAudience        string
+	GatewaySecret      string
+	AllowedOrigins     []string
+	AllowDegradedRedis bool
+	ReadTimeout        time.Duration
+	WriteTimeout       time.Duration
+	IdleTimeout        time.Duration
+	ShutdownTimeout    time.Duration
+	DBMaxOpenConns     int
+	DBMaxIdleConns     int
+	DBConnMaxLifetime  time.Duration
 }
 
 func (c *Config) IsProduction() bool {
@@ -47,14 +50,19 @@ func (c *Config) IsDevelopment() bool {
 func Load() (*Config, error) {
 	env := getEnv("ENV", "development")
 	portStr := getEnv("PORT", "8080")
-	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/lukmi?sslmode=disable")
+
+	// Read APP_DATABASE_URL first (with fallback to DATABASE_URL for dev/test)
+	dbURL := getEnv("APP_DATABASE_URL", getEnv("DATABASE_URL", "postgres://lukmi_app:lukmi_app@localhost:5432/lukmi?sslmode=disable"))
 	redisURL := getEnv("REDIS_URL", "redis://localhost:6379")
 	brokersStr := getEnv("REDPANDA_BROKERS", getEnv("KAFKA_BROKERS", "localhost:9092"))
 	kafkaTopic := getEnv("KAFKA_TOPIC", "messaging.events")
 	kafkaGroupID := getEnv("KAFKA_GROUP_ID", "messaging-service-group")
 	jwtSecret := os.Getenv("JWT_SECRET")
+	jwtIssuer := getEnv("JWT_ISSUER", "lukmi-auth")
+	jwtAudience := getEnv("JWT_AUDIENCE", "lukmi-messaging")
 	gatewaySecret := os.Getenv("GATEWAY_SECRET")
-	originsStr := getEnv("ALLOWED_ORIGINS", "")
+	originsStr := os.Getenv("ALLOWED_ORIGINS")
+	allowDegradedRedis := getBoolEnv("ALLOW_DEGRADED_REDIS", false)
 
 	brokers := parseCommaList(brokersStr)
 	origins := parseCommaList(originsStr)
@@ -104,23 +112,26 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Env:               env,
-		Port:              portStr,
-		DatabaseURL:       dbURL,
-		RedisURL:          redisURL,
-		RedpandaBrokers:   brokers,
-		KafkaTopic:        kafkaTopic,
-		KafkaGroupID:      kafkaGroupID,
-		JWTSecret:         jwtSecret,
-		GatewaySecret:     gatewaySecret,
-		AllowedOrigins:    origins,
-		ReadTimeout:       time.Duration(readTimeoutSec) * time.Second,
-		WriteTimeout:      time.Duration(writeTimeoutSec) * time.Second,
-		IdleTimeout:       time.Duration(idleTimeoutSec) * time.Second,
-		ShutdownTimeout:   time.Duration(shutdownTimeoutSec) * time.Second,
-		DBMaxOpenConns:    dbMaxOpenConns,
-		DBMaxIdleConns:    dbMaxIdleConns,
-		DBConnMaxLifetime: time.Duration(dbConnLifetimeMin) * time.Minute,
+		Env:                env,
+		Port:               portStr,
+		DatabaseURL:        dbURL,
+		RedisURL:           redisURL,
+		RedpandaBrokers:    brokers,
+		KafkaTopic:         kafkaTopic,
+		KafkaGroupID:       kafkaGroupID,
+		JWTSecret:          jwtSecret,
+		JWTIssuer:          jwtIssuer,
+		JWTAudience:        jwtAudience,
+		GatewaySecret:      gatewaySecret,
+		AllowedOrigins:     origins,
+		AllowDegradedRedis: allowDegradedRedis,
+		ReadTimeout:        time.Duration(readTimeoutSec) * time.Second,
+		WriteTimeout:       time.Duration(writeTimeoutSec) * time.Second,
+		IdleTimeout:        time.Duration(idleTimeoutSec) * time.Second,
+		ShutdownTimeout:    time.Duration(shutdownTimeoutSec) * time.Second,
+		DBMaxOpenConns:     dbMaxOpenConns,
+		DBMaxIdleConns:     dbMaxIdleConns,
+		DBConnMaxLifetime:  time.Duration(dbConnLifetimeMin) * time.Minute,
 	}
 
 	// Default fallback values for development/testing mode ONLY
@@ -131,11 +142,14 @@ func Load() (*Config, error) {
 		if cfg.GatewaySecret == "" {
 			cfg.GatewaySecret = "development-only-gateway-secret-16bytes"
 		}
+		if len(cfg.AllowedOrigins) == 0 {
+			cfg.AllowedOrigins = []string{"*"}
+		}
 	}
 
 	// Strict Production Validation Rules
 	if cfg.IsProduction() {
-		if cfg.JWTSecret == "" || len(cfg.JWTSecret) < 32 || cfg.JWTSecret == "lukmi-secret-key-change-in-production" || strings.Contains(cfg.JWTSecret, "change-in-production") {
+		if cfg.JWTSecret == "" || len(cfg.JWTSecret) < 32 || strings.Contains(cfg.JWTSecret, "change-in-production") {
 			return nil, errors.New("production configuration error: JWT_SECRET must be explicitly configured with at least 32 characters in production")
 		}
 
@@ -143,8 +157,12 @@ func Load() (*Config, error) {
 			return nil, errors.New("production configuration error: GATEWAY_SECRET must be explicitly configured with at least 16 characters in production")
 		}
 
-		if cfg.DatabaseURL == "" || strings.Contains(cfg.DatabaseURL, "postgres:postgres@localhost") {
-			return nil, errors.New("production configuration error: DATABASE_URL must be explicitly set with non-default production credentials")
+		if cfg.DatabaseURL == "" || strings.Contains(cfg.DatabaseURL, "localhost:5432") {
+			return nil, errors.New("production configuration error: APP_DATABASE_URL / DATABASE_URL must be set to a valid production database endpoint")
+		}
+
+		if len(cfg.AllowedOrigins) == 0 {
+			return nil, errors.New("production configuration error: ALLOWED_ORIGINS must be explicitly configured in production")
 		}
 	}
 
@@ -153,16 +171,19 @@ func Load() (*Config, error) {
 
 func (c *Config) Redact() map[string]any {
 	return map[string]any{
-		"env":               c.Env,
-		"port":              c.Port,
-		"database_url":      redactURL(c.DatabaseURL),
-		"redis_url":         redactURL(c.RedisURL),
-		"brokers":           c.RedpandaBrokers,
-		"kafka_topic":       c.KafkaTopic,
-		"kafka_group_id":    c.KafkaGroupID,
-		"allowed_origins":   c.AllowedOrigins,
-		"db_max_open_conns": c.DBMaxOpenConns,
-		"db_max_idle_conns": c.DBMaxIdleConns,
+		"env":                  c.Env,
+		"port":                 c.Port,
+		"database_url":         redactURL(c.DatabaseURL),
+		"redis_url":            redactURL(c.RedisURL),
+		"brokers":              c.RedpandaBrokers,
+		"kafka_topic":          c.KafkaTopic,
+		"kafka_group_id":       c.KafkaGroupID,
+		"jwt_issuer":           c.JWTIssuer,
+		"jwt_audience":         c.JWTAudience,
+		"allowed_origins":      c.AllowedOrigins,
+		"allow_degraded_redis": c.AllowDegradedRedis,
+		"db_max_open_conns":    c.DBMaxOpenConns,
+		"db_max_idle_conns":    c.DBMaxIdleConns,
 	}
 }
 
@@ -185,6 +206,18 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func getBoolEnv(key string, fallback bool) bool {
+	val := os.Getenv(key)
+	if val == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(val)
+	if err != nil {
+		return fallback
+	}
+	return b
 }
 
 func getIntEnv(key string, fallback int) (int, error) {

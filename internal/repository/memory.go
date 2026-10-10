@@ -271,7 +271,6 @@ func (r *MemoryRepository) MarkReadWithOutbox(_ context.Context, read *model.Mes
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Verify message exists in conversation
 	found := false
 	for _, m := range r.messages[read.ConversationID] {
 		if m.ID == read.MessageID {
@@ -322,14 +321,15 @@ func (r *MemoryRepository) DeleteMessageWithOutbox(_ context.Context, conversati
 	return ErrNotFound
 }
 
-func (r *MemoryRepository) GetPendingOutboxEvents(_ context.Context, limit int) ([]*model.Event, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+func (r *MemoryRepository) ClaimPendingOutboxEvents(_ context.Context, _ string, _ time.Duration, limit int) ([]*model.Event, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	var pending []*model.Event
 	for id, evt := range r.outboxEvents {
 		if r.outboxStatus[id] == "pending" {
 			pending = append(pending, evt)
+			r.outboxStatus[id] = "processing"
 			if len(pending) == limit {
 				break
 			}
@@ -338,13 +338,16 @@ func (r *MemoryRepository) GetPendingOutboxEvents(_ context.Context, limit int) 
 	return pending, nil
 }
 
-func (r *MemoryRepository) MarkOutboxEventPublished(_ context.Context, eventID string) error {
+func (r *MemoryRepository) MarkOutboxEventPublished(_ context.Context, eventID string, _ string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.outboxStatus[eventID] = "published"
 	return nil
 }
 
-func (r *MemoryRepository) RecordOutboxEventFailure(_ context.Context, eventID string, _ string) error {
+func (r *MemoryRepository) RecordOutboxEventFailure(_ context.Context, eventID string, _ string, _ string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.outboxStatus[eventID] = "pending"
 	return nil
 }

@@ -10,12 +10,13 @@ import (
 )
 
 type OutboxRepository interface {
-	GetPendingOutboxEvents(ctx context.Context, limit int) ([]*model.Event, error)
-	MarkOutboxEventPublished(ctx context.Context, eventID string) error
-	RecordOutboxEventFailure(ctx context.Context, eventID string, errMsg string) error
+	ClaimPendingOutboxEvents(ctx context.Context, processorID string, leaseDuration time.Duration, limit int) ([]*model.Event, error)
+	MarkOutboxEventPublished(ctx context.Context, eventID string, processorID string) error
+	RecordOutboxEventFailure(ctx context.Context, eventID string, processorID string, errMsg string) error
 }
 
 type OutboxProcessor struct {
+	processorID  string
 	repo         OutboxRepository
 	publisher    EventPublisher
 	logger       *slog.Logger
@@ -24,11 +25,15 @@ type OutboxProcessor struct {
 	cancel       func()
 }
 
-func NewOutboxProcessor(repo OutboxRepository, publisher EventPublisher, logger *slog.Logger, pollInterval time.Duration) *OutboxProcessor {
+func NewOutboxProcessor(processorID string, repo OutboxRepository, publisher EventPublisher, logger *slog.Logger, pollInterval time.Duration) *OutboxProcessor {
 	if pollInterval <= 0 {
 		pollInterval = 500 * time.Millisecond
 	}
+	if processorID == "" {
+		processorID = "default-processor"
+	}
 	return &OutboxProcessor{
+		processorID:  processorID,
 		repo:         repo,
 		publisher:    publisher,
 		logger:       logger,
@@ -59,10 +64,10 @@ func (op *OutboxProcessor) Start(ctx context.Context) {
 }
 
 func (op *OutboxProcessor) processBatch(ctx context.Context) {
-	events, err := op.repo.GetPendingOutboxEvents(ctx, 50)
+	events, err := op.repo.ClaimPendingOutboxEvents(ctx, op.processorID, 30*time.Second, 50)
 	if err != nil {
 		if op.logger != nil {
-			op.logger.Error("outbox processor failed to fetch pending events", "error", err)
+			op.logger.Error("outbox processor failed to claim pending events", "processor_id", op.processorID, "error", err)
 		}
 		return
 	}
@@ -74,12 +79,19 @@ func (op *OutboxProcessor) processBatch(ctx context.Context) {
 
 		pubErr := op.publisher.Publish(ctx, *event)
 		if pubErr == nil {
-			_ = op.repo.MarkOutboxEventPublished(ctx, event.ID)
-			if op.logger != nil {
+			if markErr := op.repo.MarkOutboxEventPublished(ctx, event.ID, op.processorID); markErr != nil {
+				if op.logger != nil {
+					op.logger.Error("outbox processor failed to mark event published", "event_id", event.ID, "error", markErr)
+				}
+			} else if op.logger != nil {
 				op.logger.Debug("outbox event published successfully", "event_id", event.ID, "event_type", event.Type)
 			}
 		} else {
-			_ = op.repo.RecordOutboxEventFailure(ctx, event.ID, pubErr.Error())
+			if recErr := op.repo.RecordOutboxEventFailure(ctx, event.ID, op.processorID, pubErr.Error()); recErr != nil {
+				if op.logger != nil {
+					op.logger.Error("outbox processor failed to record event failure", "event_id", event.ID, "error", recErr)
+				}
+			}
 			if op.logger != nil {
 				op.logger.Error("outbox event publish failed", "event_id", event.ID, "error", pubErr)
 			}
@@ -91,14 +103,14 @@ func (op *OutboxProcessor) flushPending(ctx context.Context) {
 	flushCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	events, err := op.repo.GetPendingOutboxEvents(flushCtx, 100)
+	events, err := op.repo.ClaimPendingOutboxEvents(flushCtx, op.processorID, 10*time.Second, 100)
 	if err != nil || len(events) == 0 {
 		return
 	}
 
 	for _, event := range events {
 		if op.publisher.Publish(flushCtx, *event) == nil {
-			_ = op.repo.MarkOutboxEventPublished(flushCtx, event.ID)
+			_ = op.repo.MarkOutboxEventPublished(flushCtx, event.ID, op.processorID)
 		}
 	}
 }

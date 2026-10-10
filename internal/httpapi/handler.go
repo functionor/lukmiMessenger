@@ -60,8 +60,14 @@ func (h *Handler) healthz(w http.ResponseWriter, _ *http.Request) {
 
 func (h *Handler) readyz(w http.ResponseWriter, r *http.Request) {
 	if err := h.repo.Ping(r.Context()); err != nil {
-		response.Error(w, http.StatusServiceUnavailable, "database connection unready")
+		response.Error(w, http.StatusServiceUnavailable, "database unready: "+err.Error())
 		return
+	}
+	if h.cache != nil {
+		if err := h.cache.Ping(r.Context()); err != nil {
+			response.Error(w, http.StatusServiceUnavailable, "cache unready: "+err.Error())
+			return
+		}
 	}
 	response.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }

@@ -71,15 +71,31 @@ func Auth(cfg *config.Config, logger *slog.Logger) func(http.Handler) http.Handl
 
 				if tokenStr != "" {
 					parsedToken, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-						// Reject 'none' and non-HMAC signing methods
-						if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-							return nil, fmt.Errorf("unexpected signing algorithm: %v", token.Header["alg"])
+						// Strictly pin HS256 algorithm
+						if token.Method.Alg() != "HS256" {
+							return nil, fmt.Errorf("unsupported signing algorithm: %v", token.Header["alg"])
 						}
 						return secretBytes, nil
 					}, jwt.WithExpirationRequired())
 
 					if err == nil && parsedToken.Valid {
 						if claims, ok := parsedToken.Claims.(jwt.MapClaims); ok {
+							// Enforce issuer check if configured
+							if cfg.JWTIssuer != "" {
+								if iss, ok := claims["iss"].(string); !ok || iss != cfg.JWTIssuer {
+									response.Error(w, http.StatusUnauthorized, "unauthorized: invalid token issuer")
+									return
+								}
+							}
+
+							// Enforce audience check if configured
+							if cfg.JWTAudience != "" {
+								if aud, ok := claims["aud"].(string); !ok || aud != cfg.JWTAudience {
+									response.Error(w, http.StatusUnauthorized, "unauthorized: invalid token audience")
+									return
+								}
+							}
+
 							var candidateID string
 							if sub, ok := claims["sub"].(string); ok && sub != "" {
 								candidateID = sub
@@ -140,7 +156,6 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 			reqID, _ := r.Context().Value(RequestIDKey).(string)
 			userID, _ := r.Context().Value(UserIDKey).(string)
 
-			// Sanitize and redact sensitive query params (e.g. token) from request URL before logging
 			sanitizedPath := sanitizeURLPath(r.URL)
 
 			logger.Info("http request",

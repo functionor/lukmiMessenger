@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,12 +47,15 @@ type Hub struct {
 	logger         *slog.Logger
 	cancel         func()
 	allowedOrigins []string
+	isProduction   bool
 }
 
 func NewHub(cfg *config.Config, c cache.Cache, logger *slog.Logger) *Hub {
 	var origins []string
+	isProd := false
 	if cfg != nil {
 		origins = cfg.AllowedOrigins
+		isProd = cfg.IsProduction()
 	}
 
 	h := &Hub{
@@ -59,6 +63,7 @@ func NewHub(cfg *config.Config, c cache.Cache, logger *slog.Logger) *Hub {
 		cache:          c,
 		logger:         logger,
 		allowedOrigins: origins,
+		isProduction:   isProd,
 	}
 
 	h.upgrader = websocket.Upgrader{
@@ -77,11 +82,19 @@ func NewHub(cfg *config.Config, c cache.Cache, logger *slog.Logger) *Hub {
 func (h *Hub) checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		return true // Permit native clients (Flutter Android/iOS) without Origin header
+		// Native mobile clients (Flutter Android/iOS) do not send Origin header.
+		// Permitted because connection is authenticated prior to upgrade in ServeHTTP.
+		return true
 	}
 
 	if len(h.allowedOrigins) == 0 {
-		return true // Development mode default
+		if h.isProduction {
+			if h.logger != nil {
+				h.logger.Error("websocket connection rejected: ALLOWED_ORIGINS empty in production")
+			}
+			return false
+		}
+		return true // Permitted in development mode
 	}
 
 	u, err := url.Parse(origin)
@@ -90,7 +103,15 @@ func (h *Hub) checkOrigin(r *http.Request) bool {
 	}
 
 	for _, allowed := range h.allowedOrigins {
-		if allowed == "*" || stringsEqualFold(allowed, u.Host) || stringsEqualFold(allowed, origin) {
+		if allowed == "*" {
+			return true
+		}
+		if allowedURL, err := url.Parse(allowed); err == nil && allowedURL.Host != "" {
+			if strings.EqualFold(u.Host, allowedURL.Host) {
+				return true
+			}
+		}
+		if strings.EqualFold(u.Host, allowed) || strings.EqualFold(origin, allowed) {
 			return true
 		}
 	}
@@ -314,8 +335,4 @@ func (h *Hub) Close() {
 		}
 	}
 	h.users = make(map[string]map[*client]struct{})
-}
-
-func stringsEqualFold(s1, s2 string) bool {
-	return url.QueryEscape(s1) == url.QueryEscape(s2)
 }

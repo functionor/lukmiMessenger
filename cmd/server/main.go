@@ -34,13 +34,12 @@ func main() {
 
 	logger.Info("starting lukmi messaging service", "env", cfg.Env, "port", cfg.Port, "config", cfg.Redact())
 
-	// 1. Initialize Repository (PostgreSQL)
+	// 1. Initialize Repository (PostgreSQL mandatory in production)
 	var repo repository.Repository
-	var pgRepo *repository.PostgresRepository
-	pgRepo, err = repository.NewPostgresRepository(cfg)
+	pgRepo, err := repository.NewPostgresRepository(cfg)
 	if err != nil {
 		if cfg.IsProduction() {
-			logger.Error("production error: postgresql repository connection failed", "error", err)
+			logger.Error("production startup error: postgresql repository connection failed", "error", err)
 			os.Exit(1)
 		}
 		logger.Warn("postgresql unavailable in development mode, falling back to memory repository", "error", err)
@@ -56,7 +55,11 @@ func main() {
 	redisCache, err := cache.NewRedisCache(cfg.RedisURL, logger)
 	if err != nil {
 		if cfg.IsProduction() {
-			logger.Warn("redis cache unavailable in production mode, running in degraded single-instance cache mode", "error", err)
+			if !cfg.AllowDegradedRedis {
+				logger.Error("production startup error: redis connection failed and ALLOW_DEGRADED_REDIS is false", "error", err)
+				os.Exit(1)
+			}
+			logger.Warn("redis cache connection failed in production; running with explicitly allowed degraded cache", "error", err)
 			c = cache.NewMemoryCache()
 		} else {
 			logger.Warn("redis unavailable in development mode, falling back to memory cache", "error", err)
@@ -67,25 +70,25 @@ func main() {
 		c = redisCache
 	}
 
-	// 3. Initialize Kafka Event Publisher (Redpanda/Kafka)
+	// 3. Initialize Kafka Event Publisher (Redpanda/Kafka mandatory in production)
 	var publisher kafka.EventPublisher
 	producer, err := kafka.NewProducer(cfg.RedpandaBrokers, cfg.KafkaTopic, logger)
 	if err != nil {
 		if cfg.IsProduction() {
-			logger.Warn("kafka producer connection degraded, outbox processor will buffer events in postgresql until connected", "error", err)
-			publisher = kafka.NewMemoryPublisher(logger)
-		} else {
-			logger.Warn("kafka producer unavailable in development mode, falling back to memory publisher", "error", err)
-			publisher = kafka.NewMemoryPublisher(logger)
+			logger.Error("production startup error: kafka/redpanda producer connection failed", "error", err)
+			os.Exit(1)
 		}
+		logger.Warn("kafka producer unavailable in development mode, falling back to memory publisher", "error", err)
+		publisher = kafka.NewMemoryPublisher(logger)
 	} else {
 		logger.Info("connected to kafka/redpanda producer", "brokers", cfg.RedpandaBrokers, "topic", cfg.KafkaTopic)
 		publisher = producer
 		defer producer.Close()
 	}
 
-	// 4. Initialize Outbox Event Processor for reliable Kafka event delivery
-	outboxProcessor := kafka.NewOutboxProcessor(repo, publisher, logger, 500*time.Millisecond)
+	// 4. Initialize Outbox Event Processor for reliable event delivery
+	processorID := "proc-" + cfg.Port
+	outboxProcessor := kafka.NewOutboxProcessor(processorID, repo, publisher, logger, 500*time.Millisecond)
 	outboxCtx, cancelOutbox := context.WithCancel(context.Background())
 	outboxProcessor.Start(outboxCtx)
 	defer func() {

@@ -14,6 +14,8 @@ func testConfig() *config.Config {
 	return &config.Config{
 		Env:           "development",
 		JWTSecret:     "test-jwt-secret-32bytes-minimum-key!!",
+		JWTIssuer:     "lukmi-auth",
+		JWTAudience:   "lukmi-messaging",
 		GatewaySecret: "test-gateway-secret-key-16bytes!",
 	}
 }
@@ -60,6 +62,8 @@ func TestAuthMiddlewareJWTValid(t *testing.T) {
 	cfg := testConfig()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": "jwt-user-456",
+		"iss": cfg.JWTIssuer,
+		"aud": cfg.JWTAudience,
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
 	tokenStr, _ := token.SignedString([]byte(cfg.JWTSecret))
@@ -86,6 +90,8 @@ func TestAuthMiddlewareExpiredJWT(t *testing.T) {
 	cfg := testConfig()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": "jwt-user-456",
+		"iss": cfg.JWTIssuer,
+		"aud": cfg.JWTAudience,
 		"exp": time.Now().Add(-time.Hour).Unix(), // Expired
 	})
 	tokenStr, _ := token.SignedString([]byte(cfg.JWTSecret))
@@ -110,7 +116,6 @@ func TestAuthMiddlewareNoneAlgorithmRejected(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// Create unsigned token with 'none' alg
 	token := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
 		"sub": "attacker",
 		"exp": time.Now().Add(time.Hour).Unix(),

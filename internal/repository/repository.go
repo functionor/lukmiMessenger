@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/lukmi/messaging-service/internal/model"
 )
@@ -29,8 +30,8 @@ type Repository interface {
 	ListMessages(ctx context.Context, conversationID string, cursor string, limit int) ([]*model.Message, string, error)
 	MarkReadWithOutbox(ctx context.Context, read *model.MessageRead, event *model.Event) (*model.MessageRead, error)
 	DeleteMessageWithOutbox(ctx context.Context, conversationID, messageID, userID string, event *model.Event) error
-	GetPendingOutboxEvents(ctx context.Context, limit int) ([]*model.Event, error)
-	MarkOutboxEventPublished(ctx context.Context, eventID string) error
-	RecordOutboxEventFailure(ctx context.Context, eventID string, errMsg string) error
+	ClaimPendingOutboxEvents(ctx context.Context, processorID string, leaseDuration time.Duration, limit int) ([]*model.Event, error)
+	MarkOutboxEventPublished(ctx context.Context, eventID string, processorID string) error
+	RecordOutboxEventFailure(ctx context.Context, eventID string, processorID string, errMsg string) error
 	Ping(ctx context.Context) error
 }
